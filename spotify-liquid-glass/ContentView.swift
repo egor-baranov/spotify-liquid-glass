@@ -15,6 +15,8 @@ struct ContentView: View {
     @State private var nowPlaying: Song?
     @State private var showPlayerFullScreen = false
     @State private var playerDetent: PresentationDetent = .fraction(1.0)
+    @StateObject private var dataProvider = SpotifyDataProvider()
+    @State private var showingAccount = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -23,6 +25,8 @@ struct ContentView: View {
             TabView(selection: $selectedTab) {
                 NavigationStack(path: $homePath) {
                     HomeView(
+                        dataProvider: dataProvider,
+                        onProfileTap: { showingAccount = true },
                         onPlaylistSelect: pushPlaylist,
                         onSongSelect: handleSongSelection
                     )
@@ -41,7 +45,7 @@ struct ContentView: View {
                 }
                 .tag(AppTab.home)
 
-                SearchView()
+                SearchView(onProfileTap: { showingAccount = true })
                     .tabItem {
                         Image(systemName: AppTab.search.icon)
                         Text(AppTab.search.title)
@@ -49,15 +53,18 @@ struct ContentView: View {
                     .tag(AppTab.search)
 
                 NavigationStack(path: $libraryPath) {
-                    LibraryView(onCollectionSelect: handleLibraryCollectionSelection)
-                        .navigationDestination(for: PlaylistDetail.self) { detail in
-                            PlaylistDetailScreen(
-                                detail: detail,
-                                onSongSelect: { song in
-                                    handleSongSelection(song)
-                                }
-                            )
-                        }
+                    LibraryView(
+                        onProfileTap: { showingAccount = true },
+                        onCollectionSelect: handleLibraryCollectionSelection
+                    )
+                    .navigationDestination(for: PlaylistDetail.self) { detail in
+                        PlaylistDetailScreen(
+                            detail: detail,
+                            onSongSelect: { song in
+                                handleSongSelection(song)
+                            }
+                        )
+                    }
                 }
                 .tabItem {
                     Image(systemName: AppTab.library.icon)
@@ -101,6 +108,11 @@ struct ContentView: View {
                 .onAppear {
                     playerDetent = .fraction(1.0)
                 }
+            }
+        }
+        .sheet(isPresented: $showingAccount) {
+            AccountView {
+                showingAccount = false
             }
         }
     }
@@ -265,19 +277,66 @@ struct LiquidGlassBackground: View {
 // MARK: - Screens
 
 struct HomeView: View {
+    @ObservedObject var dataProvider: SpotifyDataProvider
+    let onProfileTap: () -> Void
     let onPlaylistSelect: (Playlist) -> Void
     let onSongSelect: (Song) -> Void
 
-    private let hero = DemoData.heroSong
-    private let mixes = DemoData.dailyMixes
-    private let quick = DemoData.quickPicks
-    private let trending = DemoData.trendingSongs
+    @State private var selectedCategory = "All"
+    private let categories = ["All", "Music", "Podcasts", "Audiobooks"]
+    
+    private var mixes: [Playlist] {
+        let playlists = dataProvider.dailyMixes.isEmpty ? DemoData.dailyMixes : dataProvider.dailyMixes
+        var result = playlists
+        if !result.isEmpty {
+            let liked = Playlist(
+                title: "Liked Songs",
+                subtitle: "Your favorites",
+                descriptor: "Playlist",
+                colors: [Color(red: 0.54, green: 0.32, blue: 0.98), Color(red: 0.3, green: 0.08, blue: 0.42)]
+            )
+            result.insert(liked, at: 0)
+        }
+        return result
+    }
+
+    private var gridPlaylists: [Playlist] {
+        var source = mixes
+        if source.isEmpty {
+            source = DemoData.dailyMixes
+        }
+        let fillers = DemoData.quickPicks + DemoData.dailyMixes
+        var fillerIndex = 0
+        while source.count < 8 {
+            source.append(fillers[fillerIndex % fillers.count])
+            fillerIndex += 1
+        }
+        return Array(source.prefix(8))
+    }
+    
+    private var quick: [Playlist] {
+        dataProvider.quickPicks.isEmpty ? DemoData.quickPicks : dataProvider.quickPicks
+    }
+    
+    private var trending: [Song] {
+        dataProvider.trendingSongs.isEmpty ? DemoData.trendingSongs : dataProvider.trendingSongs
+    }
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 32) {
-                GreetingHeader(title: "Good evening", subtitle: "Hand-picked mixes to keep you in flow.")
-                NowPlayingCard(song: hero)
+            VStack(alignment: .leading, spacing: 24) {
+                HomeProfileHeader(onTap: onProfileTap)
+                HomeCategoryBar(categories: categories, selection: $selectedCategory)
+
+                HomePlaylistGrid(playlists: gridPlaylists) { playlist in
+                    onPlaylistSelect(playlist)
+                }
+
+                if let featuredRelease = trending.first {
+                    HomeReleaseCard(song: featuredRelease) {
+                        onSongSelect(featuredRelease)
+                    }
+                }
 
                 SectionHeader(title: "Daily mixes", subtitle: "Curated for you")
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -315,12 +374,17 @@ struct HomeView: View {
 
 struct SearchView: View {
     @State private var query = ""
+    let onProfileTap: () -> Void
     private let categories = DemoData.searchCategories
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 32) {
-                GreetingHeader(title: "Search", subtitle: "Find artists, songs or podcasts.")
+            VStack(alignment: .leading, spacing: 24) {
+                GreetingHeader(
+                    title: "Search",
+                    subtitle: "Find artists, songs or podcasts.",
+                    onProfileTap: onProfileTap
+                )
                 LiquidSearchField(text: $query)
 
                 SectionHeader(title: "Browse all", subtitle: "Genres & moods")
@@ -331,13 +395,14 @@ struct SearchView: View {
                 }
             }
             .padding(.horizontal, 24)
-            .padding(.top, 54)
+            .padding(.top, 12)
             .padding(.bottom, 160)
         }
     }
 }
 
 struct LibraryView: View {
+    let onProfileTap: () -> Void
     let onCollectionSelect: (LibraryCollection) -> Void
     @State private var selectedFilter: LibraryFilter = .all
     @State private var layoutStyle: LibraryLayout = .grid
@@ -361,7 +426,8 @@ struct LibraryView: View {
             VStack(alignment: .leading, spacing: 28) {
                 LibraryTopBar(
                     title: "Your Library",
-                    subtitle: "Everything you've saved and downloaded."
+                    subtitle: "Everything you've saved and downloaded.",
+                    onProfileTap: onProfileTap
                 )
 
                 LibraryFilters(selected: $selectedFilter)
@@ -404,7 +470,7 @@ struct LibraryView: View {
                 }
             }
             .padding(.horizontal, 24)
-            .padding(.top, 0)
+            .padding(.top, 12)
             .padding(.bottom, 160)
         }
     }
@@ -415,14 +481,44 @@ struct LibraryView: View {
 struct GreetingHeader: View {
     let title: String
     let subtitle: String
+    var onProfileTap: (() -> Void)? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.largeTitle.bold())
-            Text(subtitle)
-                .font(.callout)
-                .foregroundStyle(.white.opacity(0.72))
+        VStack(alignment: .leading, spacing: 12) {
+            if let onProfileTap {
+                HStack {
+                    Button(action: onProfileTap) {
+                        Circle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        Color(red: 0.93, green: 0.34, blue: 0.63),
+                                        Color(red: 0.3, green: 0.08, blue: 0.42)
+                                    ],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                            .frame(width: 34, height: 34)
+                            .overlay(
+                                Text("EB")
+                                    .font(.caption.weight(.bold))
+                            )
+                    }
+                    .buttonStyle(.plain)
+
+                    Spacer()
+                }
+                .padding(.top, -4)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.largeTitle.bold())
+                Text(subtitle)
+                    .font(.callout)
+                    .foregroundStyle(.white.opacity(0.72))
+            }
         }
     }
 }
@@ -751,10 +847,6 @@ struct PlaylistSongRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 16) {
-                Text(String(format: "%02d", position))
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.7))
-
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(song.gradient)
                     .frame(width: 44, height: 44)
@@ -1057,26 +1149,31 @@ struct LibraryRow: View {
 struct LibraryTopBar: View {
     let title: String
     let subtitle: String
+    let onProfileTap: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 18) {
-                Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.93, green: 0.34, blue: 0.63),
-                                Color(red: 0.3, green: 0.08, blue: 0.42)
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
+                Button(action: onProfileTap) {
+                    Circle()
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color(red: 0.93, green: 0.34, blue: 0.63),
+                                    Color(red: 0.3, green: 0.08, blue: 0.42)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
                         )
-                    )
-                    .frame(width: 48, height: 48)
-                    .overlay(
-                        Text("EB")
-                            .font(.headline.weight(.bold))
-                    )
+                        .frame(width: 34, height: 34)
+                        .overlay(
+                            Text("EB")
+                                .font(.caption.weight(.bold))
+                        )
+                }
+                .buttonStyle(.plain)
+
                 Spacer()
 
                 HStack(spacing: 16) {
@@ -1084,28 +1181,26 @@ struct LibraryTopBar: View {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     } label: {
                         Image(systemName: "magnifyingglass")
-                            .font(.title3.weight(.semibold))
+                            .font(.headline.weight(.semibold))
                     }
 
                     Button {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     } label: {
                         Image(systemName: "plus")
-                            .font(.title3.weight(.semibold))
+                            .font(.headline.weight(.semibold))
                     }
                 }
                 .buttonStyle(.plain)
             }
-            .padding(.top, 8)
 
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(title)
                     .font(.largeTitle.bold())
                 Text(subtitle)
                     .font(.callout)
                     .foregroundStyle(.white.opacity(0.7))
             }
-            .padding(.top, 28)
         }
     }
 }
@@ -1687,4 +1782,141 @@ extension View {
 
 #Preview {
     ContentView()
+}
+struct HomeProfileHeader: View {
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.93, green: 0.34, blue: 0.63),
+                            Color(red: 0.3, green: 0.08, blue: 0.42)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .frame(width: 34, height: 34)
+                .overlay(
+                    Text("EB")
+                        .font(.caption.weight(.bold))
+                )
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct HomeCategoryBar: View {
+    let categories: [String]
+    @Binding var selection: String
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 12) {
+                ForEach(categories, id: \.self) { category in
+                    Button {
+                        selection = category
+                    } label: {
+                        Text(category)
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(selection == category ? Color.white : Color.white.opacity(0.08))
+                            )
+                            .foregroundStyle(selection == category ? Color.black : Color.white)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+}
+
+struct HomePlaylistGrid: View {
+    let playlists: [Playlist]
+    let onSelect: (Playlist) -> Void
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12)
+    ]
+
+    var body: some View {
+        let displayed = Array(playlists.prefix(8))
+
+        LazyVGrid(columns: columns, spacing: 6) {
+            ForEach(Array(displayed.enumerated()), id: \.offset) { index, entry in
+                let playlist = entry
+                Button {
+                    onSelect(playlist)
+                } label: {
+                    HStack(spacing: 8) {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(playlist.gradient)
+                            .frame(width: 40, height: 40)
+                            .overlay(
+                                Image(systemName: index == 0 ? "heart.fill" : "music.note")
+                                .foregroundStyle(.white.opacity(0.9))
+                            )
+                        VStack(alignment: .center, spacing: 4) {
+                            Text(index == 0 ? "Liked Songs" : playlist.title)
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(1)
+    
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 0)
+                    .frame(height: 48)
+                    .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+struct HomeReleaseCard: View {
+    let song: Song
+    let action: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("New release from")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.7))
+            Text(song.artist)
+                .font(.title3.bold())
+
+            Button(action: action) {
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(song.gradient)
+                    .frame(height: 140)
+                    .overlay(
+                        HStack {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(song.title)
+                                    .font(.headline.bold())
+                                Text(song.tagline)
+                                    .font(.caption)
+                                    .foregroundStyle(.white.opacity(0.8))
+                            }
+                            Spacer()
+                            Image(systemName: "play.fill")
+                                .font(.title2)
+                                .padding()
+                                .background(Color.white.opacity(0.2), in: Circle())
+                        }
+                        .padding()
+                    )
+            }
+            .buttonStyle(.plain)
+        }
+    }
 }
