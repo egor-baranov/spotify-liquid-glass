@@ -9,6 +9,11 @@ import SwiftUI
 import UIKit
 import CoreHaptics
 
+private let likedSongsGradientColors: [Color] = [
+    Color(red: 0.54, green: 0.32, blue: 0.98),
+    Color(red: 0.3, green: 0.08, blue: 0.42)
+]
+
 struct ContentView: View {
     @State private var selectedTab: AppTab = .home
     @State private var homePath = NavigationPath()
@@ -30,14 +35,17 @@ struct ContentView: View {
                         dataProvider: dataProvider,
                         onProfileTap: { showingAccount = true },
                         onPlaylistSelect: pushPlaylist,
-                        onSongSelect: handleSongSelection
+                        onSongSelect: handleSongSelection,
+                        onRefresh: { await refreshAllData() }
                     )
                     .navigationDestination(for: PlaylistDetail.self) { detail in
                         PlaylistDetailScreen(
                             detail: detail,
+                            likedSongsCount: detail.playlist.isLikedSongs ? dataProvider.likedSongsTotal : nil,
                             onSongSelect: { song in
                                 handleSongSelection(song)
-                            }
+                            },
+                            onSongAppear: detail.playlist.isLikedSongs ? { handleLikedSongRowAppear($0) } : nil
                         )
                     }
                 }
@@ -47,7 +55,12 @@ struct ContentView: View {
                 }
                 .tag(AppTab.home)
 
-                SearchView(onProfileTap: { showingAccount = true })
+                SearchView(
+                    dataProvider: dataProvider,
+                    onProfileTap: { showingAccount = true },
+                    onPlaylistSelect: pushPlaylist,
+                    onRefresh: { await refreshUserData() }
+                )
                     .tabItem {
                         Image(systemName: AppTab.search.icon)
                         Text(AppTab.search.title)
@@ -57,17 +70,20 @@ struct ContentView: View {
                 NavigationStack(path: $libraryPath) {
                     LibraryView(
                         onProfileTap: { showingAccount = true },
-                        userCollections: dataProvider.userPlaylists.map { $0.asLibraryCollection() },
-                        onCollectionSelect: handleLibraryCollectionSelection
+                        userCollections: libraryCollections,
+                        onCollectionSelect: handleLibraryCollectionSelection,
+                        onRefresh: { await refreshUserData() }
                     )
                         .navigationDestination(for: PlaylistDetail.self) { detail in
                             PlaylistDetailScreen(
                                 detail: detail,
+                                likedSongsCount: detail.playlist.isLikedSongs ? dataProvider.likedSongsTotal : nil,
                                 onSongSelect: { song in
                                     handleSongSelection(song)
-                            }
-                        )
-                    }
+                                },
+                                onSongAppear: detail.playlist.isLikedSongs ? { handleLikedSongRowAppear($0) } : nil
+                            )
+                        }
                 }
                 .tabItem {
                     Image(systemName: AppTab.library.icon)
@@ -100,11 +116,22 @@ struct ContentView: View {
             }
         }
         .environmentObject(userSession)
+        .environmentObject(dataProvider)
         .task {
-            await dataProvider.refreshUserContent(accessToken: userSession.accessToken)
+            await userSession.ensureProfileLoaded()
+            let token = await userSession.validUserAccessToken()
+            await dataProvider.refreshUserContent(accessToken: token)
         }
         .onChange(of: userSession.accessToken) { token in
-            Task { await dataProvider.refreshUserContent(accessToken: token) }
+            Task {
+                await userSession.ensureProfileLoaded()
+                if token != nil {
+                    let fresh = await userSession.validUserAccessToken()
+                    await dataProvider.refreshUserContent(accessToken: fresh)
+                } else {
+                    await dataProvider.refreshUserContent(accessToken: nil)
+                }
+            }
         }
         .ignoresSafeArea()
         .preferredColorScheme(.dark)
@@ -155,10 +182,13 @@ struct ContentView: View {
             return
         }
         let playlist = Playlist(
+            spotifyID: collection.playlist?.spotifyID,
             title: collection.title,
             subtitle: collection.subtitle,
             descriptor: collection.meta,
-            colors: collection.colors
+            colors: collection.colors,
+            imageURL: collection.imageURL ?? collection.playlist?.imageURL,
+            isLikedSongs: collection.playlist?.isLikedSongs ?? false
         )
         pushPlaylist(playlist)
     }
@@ -169,20 +199,47 @@ struct ContentView: View {
     }
 
     private func fetchSongs(for playlist: Playlist) async -> [Song] {
-        if let spotifyID = playlist.spotifyID,
-           let token = userSession.accessToken {
-            do {
-                let tracks = try await SpotifyAPIClient.shared.fetchPlaylistTracks(
+        if playlist.isLikedSongs {
+            let cached = await MainActor.run { dataProvider.likedSongs }
+            if !cached.isEmpty {
+                return cached
+            }
+
+            guard let token = await userSession.validUserAccessToken() ?? userSession.accessToken else {
+                debugPrint("[LikedSongs] Missing access token; returning cached results.")
+                return cached
+            }
+
+            await dataProvider.loadLikedSongs(token: token, reset: true)
+            return await MainActor.run { dataProvider.likedSongs }
+        }
+
+        if let spotifyID = playlist.spotifyID {
+            if let token = await userSession.validUserAccessToken() {
+                if let tracks = try? await SpotifyAPIClient.shared.fetchPlaylistTracks(
                     id: spotifyID,
                     accessToken: token,
                     limit: 100
-                )
-                return tracks.map { $0.asSong }
-            } catch {
-                return DemoData.playlistTracks(for: playlist)
+                ) {
+                    return tracks.map { $0.asSong }
+                }
             }
+
+            if let tracks = try? await SpotifyAPIClient.shared.fetchPlaylistTracks(id: spotifyID, limit: 100) {
+                return tracks.map { $0.asSong }
+            }
+
+            return DemoData.playlistTracks(for: playlist)
         }
         return DemoData.playlistTracks(for: playlist)
+    }
+
+    private func handleLikedSongRowAppear(_ song: Song) {
+        guard dataProvider.shouldLoadMoreLikedSongs(currentSongID: song.id) else { return }
+        Task {
+            guard let token = await userSession.validUserAccessToken() ?? userSession.accessToken else { return }
+            await dataProvider.loadMoreLikedSongs(accessToken: token)
+        }
     }
     private var miniPlayerBottomPadding: CGFloat {
         max(safeAreaBottomInset + 56, 70)
@@ -192,6 +249,57 @@ struct ContentView: View {
         UIApplication.shared.connectedScenes
             .compactMap { ($0 as? UIWindowScene)?.keyWindow }
             .first?.safeAreaInsets.bottom ?? 0
+    }
+
+    private var libraryCollections: [LibraryCollection] {
+        var collections = dataProvider.userPlaylists.map { $0.asLibraryCollection() }
+        if let liked = likedSongsCollection {
+            collections.insert(liked, at: 0)
+        }
+        return collections
+    }
+
+    private var likedSongsCollection: LibraryCollection? {
+        guard let playlist = likedSongsPlaylist else { return nil }
+        return LibraryCollection(
+            title: playlist.title,
+            subtitle: playlist.subtitle,
+            meta: playlist.descriptor,
+            icon: "heart.fill",
+            colors: playlist.colors,
+            type: .playlists,
+            isPinned: true,
+            imageURL: playlist.imageURL,
+            playlist: playlist
+        )
+    }
+
+    private var likedSongsPlaylist: Playlist? {
+        guard userSession.isLoggedIn else { return nil }
+        let subtitle = dataProvider.likedSongs.isEmpty
+            ? "Your favorites"
+            : "\(dataProvider.likedSongs.count) liked tracks"
+        return Playlist(
+            title: "Liked Songs",
+            subtitle: subtitle,
+            descriptor: "Saved tracks",
+            colors: likedSongsGradientColors,
+            imageURL: dataProvider.likedSongs.first?.artworkURL,
+            isLikedSongs: true
+        )
+    }
+
+    @MainActor
+    private func refreshAllData() async {
+        await dataProvider.refreshHome()
+        let token = await userSession.validUserAccessToken()
+        await dataProvider.refreshUserContent(accessToken: token)
+    }
+
+    @MainActor
+    private func refreshUserData() async {
+        let token = await userSession.validUserAccessToken()
+        await dataProvider.refreshUserContent(accessToken: token)
     }
 }
 
@@ -320,19 +428,21 @@ struct HomeView: View {
     let onProfileTap: () -> Void
     let onPlaylistSelect: (Playlist) -> Void
     let onSongSelect: (Song) -> Void
+    let onRefresh: () async -> Void
 
     @State private var selectedCategory = "All"
     private let categories = ["All", "Music", "Podcasts", "Audiobooks"]
 
     private var likedSongsPlaceholder: Playlist {
-        Playlist(
+        let total = max(dataProvider.likedSongsTotal, dataProvider.likedSongs.count)
+        let subtitle = total > 0 ? "\(total) liked tracks" : "Your favorites"
+        return Playlist(
             title: "Liked Songs",
-            subtitle: "Your favorites",
-            descriptor: "Playlist",
-            colors: [
-                Color(red: 0.54, green: 0.32, blue: 0.98),
-                Color(red: 0.3, green: 0.08, blue: 0.42)
-            ]
+            subtitle: subtitle,
+            descriptor: "Saved tracks",
+            colors: likedSongsGradientColors,
+            imageURL: nil,
+            isLikedSongs: true
         )
     }
 
@@ -359,7 +469,8 @@ struct HomeView: View {
             source.append(fillers[fillerIndex % fillers.count])
             fillerIndex += 1
         }
-        return [likedSongsPlaceholder] + Array(source.prefix(7))
+        let likedCard = likedSongsPlaceholder
+        return [likedCard] + Array(source.prefix(7))
     }
 
     private var quick: [Playlist] {
@@ -424,14 +535,27 @@ struct HomeView: View {
             .padding(.top, 12)
             .padding(.bottom, 160)
         }
+        .refreshable {
+            await onRefresh()
+        }
     }
 }
 
 struct SearchView: View {
+    @ObservedObject var dataProvider: SpotifyDataProvider
     @State private var query = ""
-    @EnvironmentObject private var userSession: SpotifyUserSession
     let onProfileTap: () -> Void
+    let onPlaylistSelect: (Playlist) -> Void
+    let onRefresh: () async -> Void
     private let categories = DemoData.searchCategories
+
+    private var personalPlaylists: [Playlist] {
+        dataProvider.userPlaylists.isEmpty ? DemoData.dailyMixes : dataProvider.userPlaylists
+    }
+
+    private var featuredMixes: [Playlist] {
+        dataProvider.dailyMixes.isEmpty ? DemoData.dailyMixes : dataProvider.dailyMixes
+    }
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
@@ -442,6 +566,28 @@ struct SearchView: View {
                     onProfileTap: onProfileTap
                 )
                 LiquidSearchField(text: $query)
+
+                if !personalPlaylists.isEmpty {
+                    SectionHeader(title: "Your playlists", subtitle: "Jump back in")
+                    SearchPlaylistGrid(playlists: personalPlaylists, onSelect: onPlaylistSelect)
+                }
+
+                if !featuredMixes.isEmpty {
+                    SectionHeader(title: "Featured mixes", subtitle: "Handpicked for you")
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 16) {
+                            ForEach(featuredMixes) { playlist in
+                                Button {
+                                    onPlaylistSelect(playlist)
+                                } label: {
+                                    DailyMixCard(playlist: playlist)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.trailing, 6)
+                    }
+                }
 
                 SectionHeader(title: "Browse all", subtitle: "Genres & moods")
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 18), count: 2), spacing: 18) {
@@ -454,6 +600,9 @@ struct SearchView: View {
             .padding(.top, 12)
             .padding(.bottom, 160)
         }
+        .refreshable {
+            await onRefresh()
+        }
     }
 }
 
@@ -461,6 +610,7 @@ struct LibraryView: View {
     let onProfileTap: () -> Void
     let userCollections: [LibraryCollection]
     let onCollectionSelect: (LibraryCollection) -> Void
+    let onRefresh: () async -> Void
     @State private var selectedFilter: LibraryFilter = .all
     @State private var layoutStyle: LibraryLayout = .grid
 
@@ -525,6 +675,9 @@ struct LibraryView: View {
             .padding(.horizontal, 24)
             .padding(.top, 12)
             .padding(.bottom, 160)
+        }
+        .refreshable {
+            await onRefresh()
         }
     }
 }
@@ -757,8 +910,18 @@ struct TrendingRow: View {
 }
 
 struct PlaylistDetailScreen: View {
+    @EnvironmentObject private var dataProvider: SpotifyDataProvider
     let detail: PlaylistDetail
+    let likedSongsCount: Int?
     let onSongSelect: (Song) -> Void
+    var onSongAppear: ((Song) -> Void)? = nil
+
+    private var displayedSongs: [Song] {
+        if detail.playlist.isLikedSongs {
+            return dataProvider.likedSongs
+        }
+        return detail.songs
+    }
 
     var body: some View {
         ZStack {
@@ -774,13 +937,16 @@ struct PlaylistDetailScreen: View {
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 24) {
-                    PlaylistHeader(detail: detail)
+                    PlaylistHeader(detail: detail, likedSongsCount: likedSongsCount)
                     PlaylistActionRow()
 
                     VStack(spacing: 18) {
-                        ForEach(Array(detail.songs.enumerated()), id: \.element.id) { index, song in
+                        ForEach(Array(displayedSongs.enumerated()), id: \.element.id) { index, song in
                             PlaylistSongRow(position: index + 1, song: song) {
                                 onSongSelect(song)
+                            }
+                            .onAppear {
+                                onSongAppear?(song)
                             }
                         }
                     }
@@ -797,18 +963,43 @@ struct PlaylistDetailScreen: View {
 struct PlaylistHeader: View {
     let detail: PlaylistDetail
     private let coverSize: CGFloat = 250
+    var likedSongsCount: Int? = nil
+
+    private var likedSongsSubtitle: String {
+        let count = likedSongsCount ?? 0
+        if count > 0 {
+            return "\(count) liked tracks"
+        }
+        return detail.playlist.subtitle
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            CoverImageView(
-                imageURL: detail.playlist.imageURL,
-                size: coverSize,
-                cornerRadius: 32,
-                gradient: detail.playlist.gradient,
-                overlayIcon: detail.playlist.imageURL == nil ? "music.note" : nil
-            )
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.bottom, 24)
+            if detail.playlist.isLikedSongs {
+                CoverImageView(
+                    imageURL: nil,
+                    size: coverSize,
+                    cornerRadius: 32,
+                    gradient: LinearGradient(
+                        colors: likedSongsGradientColors,
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    overlayIcon: "heart.fill"
+                )
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.bottom, 24)
+            } else {
+                CoverImageView(
+                    imageURL: detail.playlist.imageURL,
+                    size: coverSize,
+                    cornerRadius: 32,
+                    gradient: detail.playlist.gradient,
+                    overlayIcon: detail.playlist.imageURL == nil ? "music.note" : nil
+                )
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.bottom, 24)
+            }
 
             Text(detail.playlist.title)
                 .font(.largeTitle.bold())
@@ -816,9 +1007,9 @@ struct PlaylistHeader: View {
 
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(detail.playlist.subtitle)
+                    Text(detail.playlist.isLikedSongs ? likedSongsSubtitle : detail.playlist.subtitle)
                         .font(.subheadline.weight(.semibold))
-                    Text("Playlist • \(detail.playlist.descriptor)")
+                    Text(detail.playlist.isLikedSongs ? "Playlist • Saved tracks" : "Playlist • \(detail.playlist.descriptor)")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.7))
                 }
@@ -1141,6 +1332,57 @@ struct SearchCategoryCard: View {
     }
 }
 
+struct SearchPlaylistGrid: View {
+    let playlists: [Playlist]
+    let onSelect: (Playlist) -> Void
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 18),
+        GridItem(.flexible(), spacing: 18)
+    ]
+
+    var body: some View {
+        LazyVGrid(columns: columns, spacing: 18) {
+            ForEach(playlists.prefix(8)) { playlist in
+                Button {
+                    onSelect(playlist)
+                } label: {
+                    SearchPlaylistCard(playlist: playlist)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+struct SearchPlaylistCard: View {
+    let playlist: Playlist
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            CoverImageView(
+                imageURL: playlist.imageURL,
+                size: 150,
+                cornerRadius: 28,
+                gradient: playlist.gradient
+            )
+            Text(playlist.title)
+                .font(.headline)
+                .lineLimit(2)
+            Text(playlist.subtitle)
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.7))
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(Color.white.opacity(0.05))
+        )
+    }
+}
+
 struct LibraryRow: View {
     let collection: LibraryCollection
 
@@ -1270,6 +1512,7 @@ struct LibraryGridView: View {
 
 struct LibraryGridCard: View {
     let collection: LibraryCollection
+    private let cardHeight: CGFloat = 220
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1283,11 +1526,16 @@ struct LibraryGridCard: View {
 
             Text(collection.title)
                 .font(.headline)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
             Text(collection.subtitle)
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.7))
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, minHeight: cardHeight, alignment: .top)
         .padding(14)
         .glassSurface(cornerRadius: 26)
     }
@@ -1416,6 +1664,7 @@ struct Playlist: Identifiable, Hashable {
     let descriptor: String
     let colors: [Color]
     let imageURL: URL?
+    let isLikedSongs: Bool
 
     init(
         spotifyID: String? = nil,
@@ -1423,7 +1672,8 @@ struct Playlist: Identifiable, Hashable {
         subtitle: String,
         descriptor: String,
         colors: [Color],
-        imageURL: URL? = nil
+        imageURL: URL? = nil,
+        isLikedSongs: Bool = false
     ) {
         self.spotifyID = spotifyID
         self.title = title
@@ -1431,6 +1681,7 @@ struct Playlist: Identifiable, Hashable {
         self.descriptor = descriptor
         self.colors = colors
         self.imageURL = imageURL
+        self.isLikedSongs = isLikedSongs
     }
 
     var gradient: LinearGradient {
@@ -1953,15 +2204,14 @@ struct HomePlaylistGrid: View {
         let displayed = Array(playlists.prefix(8))
 
         LazyVGrid(columns: columns, spacing: 10) {
-            ForEach(Array(displayed.enumerated()), id: \.offset) { index, entry in
-                let playlist = entry
-                let isLiked = index == 0
+            ForEach(displayed) { playlist in
+                let isLiked = playlist.isLikedSongs
                 Button {
                     onSelect(playlist)
                 } label: {
                     HStack(spacing: 10) {
                         CoverImageView(
-                            imageURL: isLiked ? nil : playlist.imageURL,
+                            imageURL: playlist.imageURL,
                             size: 48,
                             cornerRadius: 14,
                             gradient: playlist.gradient,

@@ -2,10 +2,24 @@ import Foundation
 import SwiftUI
 import Combine
 
-enum SpotifyAPIError: Error {
+enum SpotifyAPIError: Error, LocalizedError {
     case missingCredentials
     case invalidResponse
     case decodingFailed
+    case httpError(status: Int, message: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingCredentials:
+            return "Missing Spotify API credentials."
+        case .invalidResponse:
+            return "Received an unexpected response from Spotify."
+        case .decodingFailed:
+            return "Failed to decode Spotify response."
+        case let .httpError(status, message):
+            return "Spotify API returned HTTP \(status): \(message)"
+        }
+    }
 }
 
 struct SpotifyAuthConfiguration {
@@ -160,18 +174,58 @@ final class SpotifyAPIClient {
         return try JSONDecoder().decode(SpotifyUserProfile.self, from: data)
     }
 
-    func fetchPlaylistTracks(id: String, accessToken: String, limit: Int = 100) async throws -> [SpotifyTrack] {
+    func fetchPlaylistTracks(id: String, accessToken: String? = nil, limit: Int = 100) async throws -> [SpotifyTrack] {
         var components = URLComponents(string: "https://api.spotify.com/v1/playlists/\(id)/tracks")!
         components.queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        var request = URLRequest(url: components.url!)
+        let bearer = try await token(for: accessToken)
+        request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw SpotifyAPIError.invalidResponse
+        }
+        guard http.statusCode == 200 else {
+            let message = String(data: data, encoding: .utf8) ?? "Unknown error"
+            throw SpotifyAPIError.httpError(status: http.statusCode, message: message)
+        }
+        do {
+            let decoded = try JSONDecoder().decode(SpotifyPlaylistTracksResponse.self, from: data)
+            return decoded.items.compactMap { $0.track }
+        } catch {
+            throw SpotifyAPIError.decodingFailed
+        }
+    }
+
+    private func token(for override: String?) async throws -> String {
+        if let override {
+            return override
+        }
+        return try await authManager.validAccessToken()
+    }
+
+    func fetchLikedTracks(accessToken: String, limit: Int = 50, offset: Int = 0) async throws -> SpotifySavedTracksResponse {
+        var components = URLComponents(string: "https://api.spotify.com/v1/me/tracks")!
+        components.queryItems = [
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "offset", value: String(offset))
+        ]
         var request = URLRequest(url: components.url!)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        guard let http = response as? HTTPURLResponse else {
             throw SpotifyAPIError.invalidResponse
         }
-        let decoded = try JSONDecoder().decode(SpotifyPlaylistTracksResponse.self, from: data)
-        return decoded.items.compactMap { $0.track }
+        guard http.statusCode == 200 else {
+            let message = String(data: data, encoding: .utf8) ?? "Unknown error"
+            throw SpotifyAPIError.httpError(status: http.statusCode, message: message)
+        }
+        do {
+            return try JSONDecoder().decode(SpotifySavedTracksResponse.self, from: data)
+        } catch {
+            throw SpotifyAPIError.decodingFailed
+        }
     }
 }
 
@@ -238,6 +292,17 @@ struct SpotifyPlaylistTracksResponse: Decodable {
     let items: [Item]
 }
 
+struct SpotifySavedTracksResponse: Decodable {
+    struct Item: Decodable {
+        let track: SpotifyTrack?
+    }
+    let items: [Item]
+    let total: Int
+    let limit: Int
+    let next: String?
+    let offset: Int
+}
+
 struct SpotifyUserProfile: Decodable {
     let display_name: String?
     let images: [SpotifyUserImage]?
@@ -255,8 +320,12 @@ final class SpotifyDataProvider: ObservableObject {
     @Published var trendingSongs: [Song] = []
     @Published var releaseHighlight: Song?
     @Published var userPlaylists: [Playlist] = []
+    @Published var likedSongs: [Song] = []
+    @Published var likedSongsTotal: Int = 0
 
     private let api = SpotifyAPIClient.shared
+    private var likedSongsNextOffset: Int?
+    private var isLoadingLikedSongs = false
 
     init() {
         Task { await refreshHome() }
@@ -296,15 +365,72 @@ final class SpotifyDataProvider: ObservableObject {
     func refreshUserContent(accessToken: String?) async {
         guard let token = accessToken else {
             userPlaylists = []
+            likedSongs = []
+            likedSongsTotal = 0
+            likedSongsNextOffset = nil
             return
         }
 
+        await fetchUserPlaylists(token: token)
+        await loadLikedSongs(token: token, reset: true)
+    }
+
+    private func fetchUserPlaylists(token: String) async {
         do {
             let remote = try await api.fetchUserPlaylists(accessToken: token, limit: 50)
             userPlaylists = remote.map { $0.asPlaylist }
         } catch {
             userPlaylists = []
         }
+    }
+
+    func loadLikedSongs(token: String, reset: Bool) async {
+        if isLoadingLikedSongs { return }
+        if !reset, likedSongsNextOffset == nil { return }
+
+        isLoadingLikedSongs = true
+        defer { isLoadingLikedSongs = false }
+
+        let offset = reset ? 0 : (likedSongsNextOffset ?? 0)
+
+        do {
+            let response = try await api.fetchLikedTracks(accessToken: token, limit: 50, offset: offset)
+            let songs = response.items.compactMap { $0.track?.asSong }
+
+            if reset {
+                likedSongs = songs
+            } else {
+                likedSongs.append(contentsOf: songs)
+            }
+
+            likedSongsTotal = response.total
+            if response.next != nil {
+                likedSongsNextOffset = response.offset + response.limit
+            } else {
+                likedSongsNextOffset = nil
+            }
+        } catch {
+            if reset {
+                likedSongs = []
+                likedSongsTotal = 0
+                likedSongsNextOffset = nil
+            }
+        }
+    }
+
+    func refreshLikedSongs(accessToken: String) async {
+        await loadLikedSongs(token: accessToken, reset: true)
+    }
+
+    func loadMoreLikedSongs(accessToken: String) async {
+        await loadLikedSongs(token: accessToken, reset: false)
+    }
+
+    func shouldLoadMoreLikedSongs(currentSongID: UUID) -> Bool {
+        guard let index = likedSongs.firstIndex(where: { $0.id == currentSongID }) else { return false }
+        guard likedSongsNextOffset != nil else { return false }
+        guard !isLoadingLikedSongs else { return false }
+        return index >= max(likedSongs.count - 5, 0)
     }
 }
 
@@ -438,5 +564,57 @@ final class SpotifyUserSession: ObservableObject {
         avatarURL = nil
         storage.removeObject(forKey: "spotify_display_name")
         storage.removeObject(forKey: "spotify_avatar_url")
+    }
+
+    func ensureProfileLoaded() async {
+        guard (displayName == nil || avatarURL == nil),
+              let token = accessToken else { return }
+        do {
+            let profile = try await SpotifyAPIClient.shared.fetchCurrentUserProfile(accessToken: token)
+            await MainActor.run {
+                self.updateProfile(profile)
+            }
+        } catch {
+            // ignore; we'll retry on next login
+        }
+    }
+
+    func validUserAccessToken() async -> String? {
+        if let token = accessToken {
+            if let expiration,
+               expiration > Date().addingTimeInterval(60) {
+                return token
+            }
+        }
+
+        if let refreshed = await refreshAccessToken() {
+            return refreshed
+        }
+
+        return accessToken
+    }
+
+    private func refreshAccessToken() async -> String? {
+        guard let refreshToken = refreshToken else { return nil }
+        guard let url = URL(string: "http://127.0.0.1:5001/refresh") else { return nil }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["refresh_token": refreshToken], options: [])
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                return nil
+            }
+            let decoded = try JSONDecoder().decode(TokenExchangeResponse.self, from: data)
+            await MainActor.run {
+                self.update(with: decoded)
+            }
+            return decoded.access_token
+        } catch {
+            return nil
+        }
     }
 }
