@@ -7,6 +7,7 @@
 
 import SwiftUI
 import UIKit
+import CoreHaptics
 
 struct ContentView: View {
     @State private var selectedTab: AppTab = .home
@@ -17,6 +18,7 @@ struct ContentView: View {
     @State private var playerDetent: PresentationDetent = .fraction(1.0)
     @StateObject private var dataProvider = SpotifyDataProvider()
     @State private var showingAccount = false
+    @StateObject private var userSession = SpotifyUserSession.shared
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -55,13 +57,14 @@ struct ContentView: View {
                 NavigationStack(path: $libraryPath) {
                     LibraryView(
                         onProfileTap: { showingAccount = true },
+                        userCollections: dataProvider.userPlaylists.map { $0.asLibraryCollection() },
                         onCollectionSelect: handleLibraryCollectionSelection
                     )
-                    .navigationDestination(for: PlaylistDetail.self) { detail in
-                        PlaylistDetailScreen(
-                            detail: detail,
-                            onSongSelect: { song in
-                                handleSongSelection(song)
+                        .navigationDestination(for: PlaylistDetail.self) { detail in
+                            PlaylistDetailScreen(
+                                detail: detail,
+                                onSongSelect: { song in
+                                    handleSongSelection(song)
                             }
                         )
                     }
@@ -81,7 +84,7 @@ struct ContentView: View {
                 MiniPlayerView(
                     song: song,
                     onExpand: {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        Haptics.impact(.light)
                         showPlayerFullScreen = true
                     },
                     onClose: {
@@ -95,6 +98,13 @@ struct ContentView: View {
                 .padding(.bottom, miniPlayerBottomPadding)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+        }
+        .environmentObject(userSession)
+        .task {
+            await dataProvider.refreshUserContent(accessToken: userSession.accessToken)
+        }
+        .onChange(of: userSession.accessToken) { token in
+            Task { await dataProvider.refreshUserContent(accessToken: token) }
         }
         .ignoresSafeArea()
         .preferredColorScheme(.dark)
@@ -114,20 +124,22 @@ struct ContentView: View {
             AccountView {
                 showingAccount = false
             }
+            .environmentObject(userSession)
         }
     }
 
     private func pushPlaylist(_ playlist: Playlist) {
-        let detail = PlaylistDetail(
-            playlist: playlist,
-            songs: DemoData.playlistTracks(for: playlist)
-        )
-
-        switch selectedTab {
-        case .library:
-            libraryPath.append(detail)
-        default:
-            homePath.append(detail)
+        let destinationTab = selectedTab
+        Task {
+            let detail = await buildPlaylistDetail(for: playlist)
+            await MainActor.run {
+                switch destinationTab {
+                case .library:
+                    libraryPath.append(detail)
+                default:
+                    homePath.append(detail)
+                }
+            }
         }
     }
 
@@ -138,6 +150,10 @@ struct ContentView: View {
     }
 
     private func handleLibraryCollectionSelection(_ collection: LibraryCollection) {
+        if let playlist = collection.playlist {
+            pushPlaylist(playlist)
+            return
+        }
         let playlist = Playlist(
             title: collection.title,
             subtitle: collection.subtitle,
@@ -145,6 +161,28 @@ struct ContentView: View {
             colors: collection.colors
         )
         pushPlaylist(playlist)
+    }
+
+    private func buildPlaylistDetail(for playlist: Playlist) async -> PlaylistDetail {
+        let tracks = await fetchSongs(for: playlist)
+        return PlaylistDetail(playlist: playlist, songs: tracks)
+    }
+
+    private func fetchSongs(for playlist: Playlist) async -> [Song] {
+        if let spotifyID = playlist.spotifyID,
+           let token = userSession.accessToken {
+            do {
+                let tracks = try await SpotifyAPIClient.shared.fetchPlaylistTracks(
+                    id: spotifyID,
+                    accessToken: token,
+                    limit: 100
+                )
+                return tracks.map { $0.asSong }
+            } catch {
+                return DemoData.playlistTracks(for: playlist)
+            }
+        }
+        return DemoData.playlistTracks(for: playlist)
     }
     private var miniPlayerBottomPadding: CGFloat {
         max(safeAreaBottomInset + 56, 70)
@@ -278,48 +316,65 @@ struct LiquidGlassBackground: View {
 
 struct HomeView: View {
     @ObservedObject var dataProvider: SpotifyDataProvider
+    @EnvironmentObject private var userSession: SpotifyUserSession
     let onProfileTap: () -> Void
     let onPlaylistSelect: (Playlist) -> Void
     let onSongSelect: (Song) -> Void
 
     @State private var selectedCategory = "All"
     private let categories = ["All", "Music", "Podcasts", "Audiobooks"]
-    
-    private var mixes: [Playlist] {
-        let playlists = dataProvider.dailyMixes.isEmpty ? DemoData.dailyMixes : dataProvider.dailyMixes
-        var result = playlists
-        if !result.isEmpty {
-            let liked = Playlist(
-                title: "Liked Songs",
-                subtitle: "Your favorites",
-                descriptor: "Playlist",
-                colors: [Color(red: 0.54, green: 0.32, blue: 0.98), Color(red: 0.3, green: 0.08, blue: 0.42)]
-            )
-            result.insert(liked, at: 0)
+
+    private var likedSongsPlaceholder: Playlist {
+        Playlist(
+            title: "Liked Songs",
+            subtitle: "Your favorites",
+            descriptor: "Playlist",
+            colors: [
+                Color(red: 0.54, green: 0.32, blue: 0.98),
+                Color(red: 0.3, green: 0.08, blue: 0.42)
+            ]
+        )
+    }
+
+    private var personalPlaylists: [Playlist] {
+        if !dataProvider.userPlaylists.isEmpty {
+            return dataProvider.userPlaylists
         }
-        return result
+        let remote = dataProvider.dailyMixes
+        return remote.isEmpty ? DemoData.dailyMixes : remote
+    }
+
+    private var mixes: [Playlist] {
+        personalPlaylists
     }
 
     private var gridPlaylists: [Playlist] {
-        var source = mixes
+        var source = personalPlaylists
         if source.isEmpty {
             source = DemoData.dailyMixes
         }
         let fillers = DemoData.quickPicks + DemoData.dailyMixes
         var fillerIndex = 0
-        while source.count < 8 {
+        while source.count < 7 {
             source.append(fillers[fillerIndex % fillers.count])
             fillerIndex += 1
         }
-        return Array(source.prefix(8))
+        return [likedSongsPlaceholder] + Array(source.prefix(7))
     }
-    
+
     private var quick: [Playlist] {
-        dataProvider.quickPicks.isEmpty ? DemoData.quickPicks : dataProvider.quickPicks
+        if !dataProvider.userPlaylists.isEmpty {
+            return Array(dataProvider.userPlaylists.shuffled().prefix(6))
+        }
+        return dataProvider.quickPicks.isEmpty ? DemoData.quickPicks : dataProvider.quickPicks
     }
-    
+
     private var trending: [Song] {
         dataProvider.trendingSongs.isEmpty ? DemoData.trendingSongs : dataProvider.trendingSongs
+    }
+
+    private var releaseHighlight: Song? {
+        dataProvider.releaseHighlight ?? trending.first
     }
 
     var body: some View {
@@ -332,7 +387,7 @@ struct HomeView: View {
                     onPlaylistSelect(playlist)
                 }
 
-                if let featuredRelease = trending.first {
+                if let featuredRelease = releaseHighlight {
                     HomeReleaseCard(song: featuredRelease) {
                         onSongSelect(featuredRelease)
                     }
@@ -374,6 +429,7 @@ struct HomeView: View {
 
 struct SearchView: View {
     @State private var query = ""
+    @EnvironmentObject private var userSession: SpotifyUserSession
     let onProfileTap: () -> Void
     private let categories = DemoData.searchCategories
 
@@ -403,22 +459,19 @@ struct SearchView: View {
 
 struct LibraryView: View {
     let onProfileTap: () -> Void
+    let userCollections: [LibraryCollection]
     let onCollectionSelect: (LibraryCollection) -> Void
     @State private var selectedFilter: LibraryFilter = .all
     @State private var layoutStyle: LibraryLayout = .grid
 
-    private var orderedCollections: [LibraryCollection] {
-        DemoData.libraryCollections.sorted { lhs, rhs in
-            if lhs.isPinned != rhs.isPinned {
-                return lhs.isPinned && !rhs.isPinned
-            }
-            return lhs.title < rhs.title
-        }
+    private var baseCollections: [LibraryCollection] {
+        userCollections.isEmpty ? DemoData.libraryCollections : userCollections
     }
 
     private var filteredCollections: [LibraryCollection] {
-        guard selectedFilter != .all else { return orderedCollections }
-        return orderedCollections.filter { $0.type == selectedFilter }
+        let collections = baseCollections
+        guard selectedFilter != .all else { return collections }
+        return collections.filter { $0.type == selectedFilter }
     }
 
     var body: some View {
@@ -434,7 +487,7 @@ struct LibraryView: View {
 
                 HStack {
                     Button {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        Haptics.impact(.light)
                     } label: {
                         Label("Recents", systemImage: "arrow.up.arrow.down")
                             .font(.subheadline.weight(.semibold))
@@ -445,7 +498,7 @@ struct LibraryView: View {
 
                     Button {
                         layoutStyle.toggle()
-                        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                        Haptics.impact(.soft)
                     } label: {
                         Image(systemName: layoutStyle == .grid ? "list.bullet" : "square.grid.2x2")
                             .font(.title3.weight(.semibold))
@@ -482,31 +535,13 @@ struct GreetingHeader: View {
     let title: String
     let subtitle: String
     var onProfileTap: (() -> Void)? = nil
+    @EnvironmentObject private var userSession: SpotifyUserSession
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let onProfileTap {
                 HStack {
-                    Button(action: onProfileTap) {
-                        Circle()
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        Color(red: 0.93, green: 0.34, blue: 0.63),
-                                        Color(red: 0.3, green: 0.08, blue: 0.42)
-                                    ],
-                                    startPoint: .top,
-                                    endPoint: .bottom
-                                )
-                            )
-                            .frame(width: 34, height: 34)
-                            .overlay(
-                                Text("EB")
-                                    .font(.caption.weight(.bold))
-                            )
-                    }
-                    .buttonStyle(.plain)
-
+                    ProfileBubble(size: 34, action: onProfileTap)
                     Spacer()
                 }
                 .padding(.top, -4)
@@ -593,20 +628,29 @@ struct DailyMixCard: View {
     let playlist: Playlist
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(playlist.title)
-                .font(.headline.weight(.semibold))
-            Text(playlist.subtitle)
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.78))
-                .lineLimit(2)
+        HStack(spacing: 16) {
+            CoverImageView(
+                imageURL: playlist.imageURL,
+                size: 96,
+                cornerRadius: 26,
+                gradient: playlist.gradient
+            )
+            VStack(alignment: .leading, spacing: 8) {
+                Text(playlist.title)
+                    .font(.headline.weight(.semibold))
+                    .lineLimit(1)
+                Text(playlist.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.78))
+                    .lineLimit(2)
+                Text(playlist.descriptor)
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.65))
+            }
             Spacer()
-            Label(playlist.descriptor, systemImage: "sparkles")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.white.opacity(0.92))
         }
-        .padding(24)
-        .frame(width: 220, height: 180, alignment: .leading)
+        .padding(20)
+        .frame(width: 260, height: 140, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 32, style: .continuous)
                 .fill(playlist.gradient)
@@ -647,16 +691,12 @@ struct QuickPickCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .fill(playlist.gradient)
-                .frame(height: 120)
-                .overlay(
-                    Image(systemName: "music.note.waveform")
-                        .font(.title2.weight(.bold))
-                        .foregroundStyle(.white.opacity(0.92))
-                )
-                .shadow(color: .black.opacity(0.2), radius: 12, y: 8)
-
+            CoverImageView(
+                imageURL: playlist.imageURL,
+                size: 140,
+                cornerRadius: 28,
+                gradient: playlist.gradient
+            )
             VStack(alignment: .leading, spacing: 6) {
                 Text(playlist.title)
                     .font(.headline.weight(.semibold))
@@ -760,34 +800,25 @@ struct PlaylistHeader: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(detail.playlist.gradient)
-                .frame(width: coverSize, height: coverSize)
-                .overlay(
-                    Image(systemName: "music.note")
-                        .font(.system(size: 40, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.9))
-                )
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.bottom, 24)
+            CoverImageView(
+                imageURL: detail.playlist.imageURL,
+                size: coverSize,
+                cornerRadius: 32,
+                gradient: detail.playlist.gradient,
+                overlayIcon: detail.playlist.imageURL == nil ? "music.note" : nil
+            )
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.bottom, 24)
 
             Text(detail.playlist.title)
                 .font(.largeTitle.bold())
                 .padding(.bottom, 4)
 
             HStack(spacing: 12) {
-                Circle()
-                    .fill(Color.white.opacity(0.1))
-                    .frame(width: 36, height: 36)
-                    .overlay(
-                        Text("F1")
-                            .font(.caption.bold())
-                    )
-
                 VStack(alignment: .leading, spacing: 0) {
                     Text(detail.playlist.subtitle)
                         .font(.subheadline.weight(.semibold))
-                    Text("Album • \(DateFormatter.playlistFormatter.string(from: Date()))")
+                    Text("Playlist • \(detail.playlist.descriptor)")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.7))
                 }
@@ -823,7 +854,7 @@ struct CircleIconButton: View {
 
     var body: some View {
         Button {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            Haptics.impact(.light)
         } label: {
             Circle()
                 .fill(isSolid ? Color.white.opacity(0.25) : Color.white.opacity(0.08))
@@ -847,13 +878,13 @@ struct PlaylistSongRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 16) {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(song.gradient)
-                    .frame(width: 44, height: 44)
-                    .overlay(
-                        Image(systemName: "music.note")
-                            .foregroundStyle(.white.opacity(0.85))
-                    )
+                CoverImageView(
+                    imageURL: song.artworkURL,
+                    size: 48,
+                    cornerRadius: 14,
+                    gradient: song.gradient,
+                    overlayIcon: song.artworkURL == nil ? "music.note" : nil
+                )
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text(song.title)
@@ -907,7 +938,7 @@ struct MiniPlayerView: View {
 
             Button {
                 // placeholder for playback toggle
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                Haptics.impact(.light)
             } label: {
                 Image(systemName: "play.fill")
                     .font(.headline.weight(.bold))
@@ -1034,7 +1065,7 @@ struct GlassControlButton: View {
 
     var body: some View {
         Button {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            Haptics.impact(.light)
         } label: {
             Image(systemName: systemName)
                 .font(.system(size: isPrimary ? 26 : 20, weight: .bold))
@@ -1115,14 +1146,13 @@ struct LibraryRow: View {
 
     var body: some View {
         HStack(spacing: 16) {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(collection.gradient)
-                .frame(width: 58, height: 58)
-                .overlay(
-                    Image(systemName: collection.icon)
-                        .font(.title3.weight(.bold))
-                        .foregroundStyle(.white)
-                )
+            CoverImageView(
+                imageURL: collection.imageURL ?? collection.playlist?.imageURL,
+                size: 58,
+                cornerRadius: 18,
+                gradient: collection.gradient,
+                overlayIcon: (collection.imageURL ?? collection.playlist?.imageURL) == nil ? collection.icon : nil
+            )
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(collection.title)
@@ -1154,38 +1184,20 @@ struct LibraryTopBar: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 18) {
-                Button(action: onProfileTap) {
-                    Circle()
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color(red: 0.93, green: 0.34, blue: 0.63),
-                                    Color(red: 0.3, green: 0.08, blue: 0.42)
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                        .frame(width: 34, height: 34)
-                        .overlay(
-                            Text("EB")
-                                .font(.caption.weight(.bold))
-                        )
-                }
-                .buttonStyle(.plain)
+                ProfileBubble(size: 34, action: onProfileTap)
 
                 Spacer()
 
                 HStack(spacing: 16) {
                     Button {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        Haptics.impact(.light)
                     } label: {
                         Image(systemName: "magnifyingglass")
                             .font(.headline.weight(.semibold))
                     }
 
                     Button {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        Haptics.impact(.light)
                     } label: {
                         Image(systemName: "plus")
                             .font(.headline.weight(.semibold))
@@ -1261,22 +1273,13 @@ struct LibraryGridCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(collection.gradient)
-                .frame(height: 140)
-                .overlay(
-                    VStack {
-                        if collection.isPinned {
-                            Image(systemName: "heart.fill")
-                                .font(.title2.weight(.bold))
-                                .foregroundStyle(.white)
-                        } else {
-                            Image(systemName: collection.icon)
-                                .font(.title.weight(.bold))
-                                .foregroundStyle(.white.opacity(0.95))
-                        }
-                    }
-                )
+            CoverImageView(
+                imageURL: collection.imageURL ?? collection.playlist?.imageURL,
+                size: 140,
+                cornerRadius: 22,
+                gradient: collection.gradient,
+                overlayIcon: (collection.imageURL ?? collection.playlist?.imageURL) == nil ? (collection.isPinned ? "heart.fill" : collection.icon) : nil
+            )
 
             Text(collection.title)
                 .font(.headline)
@@ -1311,6 +1314,55 @@ struct GlassButton: View {
     }
 }
 
+struct ProfileBubble: View {
+    @EnvironmentObject private var userSession: SpotifyUserSession
+    let size: CGFloat
+    let action: () -> Void
+
+    private var initials: String {
+        guard let displayName = userSession.displayName, !displayName.isEmpty else {
+            return "EB"
+        }
+        let parts = displayName.split(separator: " ")
+        let firstLetters = parts.prefix(2).compactMap { $0.first }
+        return firstLetters.map { String($0) }.joined().uppercased()
+    }
+
+    var body: some View {
+        Button(action: action) {
+            if let url = userSession.avatarURL {
+                AsyncImage(url: url) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    Circle().fill(Color.white.opacity(0.1))
+                }
+                .frame(width: size, height: size)
+                .clipShape(Circle())
+            } else {
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.93, green: 0.34, blue: 0.63),
+                                Color(red: 0.3, green: 0.08, blue: 0.42)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .frame(width: size, height: size)
+                    .overlay(
+                        Text(initials)
+                            .font(.caption.weight(.bold))
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 
 // MARK: - Data Models
 
@@ -1321,6 +1373,23 @@ struct Song: Identifiable, Hashable {
     let tagline: String
     let duration: String
     let colors: [Color]
+    let artworkURL: URL?
+
+    init(
+        title: String,
+        artist: String,
+        tagline: String,
+        duration: String,
+        colors: [Color],
+        artworkURL: URL? = nil
+    ) {
+        self.title = title
+        self.artist = artist
+        self.tagline = tagline
+        self.duration = duration
+        self.colors = colors
+        self.artworkURL = artworkURL
+    }
 
     var gradient: LinearGradient {
         LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -1341,10 +1410,28 @@ struct Song: Identifiable, Hashable {
 
 struct Playlist: Identifiable, Hashable {
     let id = UUID()
+    let spotifyID: String?
     let title: String
     let subtitle: String
     let descriptor: String
     let colors: [Color]
+    let imageURL: URL?
+
+    init(
+        spotifyID: String? = nil,
+        title: String,
+        subtitle: String,
+        descriptor: String,
+        colors: [Color],
+        imageURL: URL? = nil
+    ) {
+        self.spotifyID = spotifyID
+        self.title = title
+        self.subtitle = subtitle
+        self.descriptor = descriptor
+        self.colors = colors
+        self.imageURL = imageURL
+    }
 
     var gradient: LinearGradient {
         LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -1394,6 +1481,30 @@ struct LibraryCollection: Identifiable {
     let colors: [Color]
     let type: LibraryFilter
     let isPinned: Bool
+    let imageURL: URL?
+    let playlist: Playlist?
+
+    init(
+        title: String,
+        subtitle: String,
+        meta: String,
+        icon: String,
+        colors: [Color],
+        type: LibraryFilter,
+        isPinned: Bool,
+        imageURL: URL? = nil,
+        playlist: Playlist? = nil
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.meta = meta
+        self.icon = icon
+        self.colors = colors
+        self.type = type
+        self.isPinned = isPinned
+        self.imageURL = imageURL
+        self.playlist = playlist
+    }
 
     var gradient: LinearGradient {
         LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -1653,7 +1764,8 @@ enum DemoData {
                 Color(red: 0.39, green: 0.09, blue: 0.65)
             ],
             type: .playlists,
-            isPinned: true
+            isPinned: true,
+            playlist: nil
         ),
         LibraryCollection(
             title: "Neon Drive",
@@ -1665,7 +1777,8 @@ enum DemoData {
                 Color(red: 0.58, green: 0.12, blue: 0.4)
             ],
             type: .playlists,
-            isPinned: false
+            isPinned: false,
+            playlist: nil
         ),
         LibraryCollection(
             title: "Midnight City",
@@ -1677,7 +1790,8 @@ enum DemoData {
                 Color(red: 0.15, green: 0.08, blue: 0.34)
             ],
             type: .albums,
-            isPinned: false
+            isPinned: false,
+            playlist: nil
         ),
         LibraryCollection(
             title: "Offline",
@@ -1689,7 +1803,8 @@ enum DemoData {
                 Color(red: 0.1, green: 0.34, blue: 0.82)
             ],
             type: .downloads,
-            isPinned: false
+            isPinned: false,
+            playlist: nil
         ),
         LibraryCollection(
             title: "Wave Breaker",
@@ -1701,7 +1816,8 @@ enum DemoData {
                 Color(red: 0.03, green: 0.26, blue: 0.5)
             ],
             type: .podcasts,
-            isPinned: false
+            isPinned: false,
+            playlist: nil
         ),
         LibraryCollection(
             title: "Future Tense",
@@ -1713,7 +1829,8 @@ enum DemoData {
                 Color(red: 0.34, green: 0.15, blue: 0.62)
             ],
             type: .albums,
-            isPinned: false
+            isPinned: false,
+            playlist: nil
         ),
         LibraryCollection(
             title: "Nu Jazz Daily",
@@ -1725,7 +1842,8 @@ enum DemoData {
                 Color(red: 0.08, green: 0.54, blue: 0.7)
             ],
             type: .playlists,
-            isPinned: false
+            isPinned: false,
+            playlist: nil
         ),
         LibraryCollection(
             title: "Artist Mix",
@@ -1737,7 +1855,8 @@ enum DemoData {
                 Color(red: 0.68, green: 0.2, blue: 0.12)
             ],
             type: .artists,
-            isPinned: false
+            isPinned: false,
+            playlist: nil
         )
     ]
 
@@ -1783,30 +1902,13 @@ extension View {
 #Preview {
     ContentView()
 }
+
 struct HomeProfileHeader: View {
     let onTap: () -> Void
 
     var body: some View {
-        Button(action: onTap) {
-            Circle()
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color(red: 0.93, green: 0.34, blue: 0.63),
-                            Color(red: 0.3, green: 0.08, blue: 0.42)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
-                .frame(width: 34, height: 34)
-                .overlay(
-                    Text("EB")
-                        .font(.caption.weight(.bold))
-                )
-        }
-        .buttonStyle(.plain)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        ProfileBubble(size: 34, action: onTap)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1850,35 +1952,101 @@ struct HomePlaylistGrid: View {
     var body: some View {
         let displayed = Array(playlists.prefix(8))
 
-        LazyVGrid(columns: columns, spacing: 6) {
+        LazyVGrid(columns: columns, spacing: 10) {
             ForEach(Array(displayed.enumerated()), id: \.offset) { index, entry in
                 let playlist = entry
+                let isLiked = index == 0
                 Button {
                     onSelect(playlist)
                 } label: {
-                    HStack(spacing: 8) {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(playlist.gradient)
-                            .frame(width: 40, height: 40)
-                            .overlay(
-                                Image(systemName: index == 0 ? "heart.fill" : "music.note")
-                                .foregroundStyle(.white.opacity(0.9))
-                            )
-                        VStack(alignment: .center, spacing: 4) {
-                            Text(index == 0 ? "Liked Songs" : playlist.title)
-                                .font(.subheadline.weight(.semibold))
-                                .lineLimit(1)
-    
-                        }
+                    HStack(spacing: 10) {
+                        CoverImageView(
+                            imageURL: isLiked ? nil : playlist.imageURL,
+                            size: 48,
+                            cornerRadius: 14,
+                            gradient: playlist.gradient,
+                            overlayIcon: isLiked ? "heart.fill" : nil
+                        )
+                        Text(isLiked ? "Liked Songs" : playlist.title)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
                         Spacer()
                     }
-                    .padding(.horizontal, 0)
-                    .frame(height: 48)
+                    .padding(.horizontal, 8)
+                    .frame(height: 54)
                     .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 }
                 .buttonStyle(.plain)
             }
         }
+    }
+}
+
+struct CoverImageView: View {
+    let imageURL: URL?
+    let size: CGFloat
+    let cornerRadius: CGFloat
+    let gradient: LinearGradient
+    var overlayIcon: String? = nil
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(gradient)
+
+            if let url = imageURL {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    case .failure:
+                        Color.clear
+                    case .empty:
+                        Color.white.opacity(0.05)
+                    @unknown default:
+                        Color.clear
+                    }
+                }
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            }
+
+            if let overlayIcon {
+                Image(systemName: overlayIcon)
+                    .font(.system(size: size * 0.35, weight: .bold))
+                    .foregroundStyle(.white)
+                    .shadow(radius: 6)
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.15), lineWidth: 0.8)
+        )
+    }
+}
+
+enum Haptics {
+    #if os(iOS)
+    private static let supportsHaptics: Bool = {
+        if #available(iOS 13.0, *) {
+            return CHHapticEngine.capabilitiesForHardware().supportsHaptics
+        }
+        return false
+    }()
+    #else
+    private static let supportsHaptics = false
+    #endif
+
+    static func impact(_ style: UIImpactFeedbackGenerator.FeedbackStyle) {
+        #if os(iOS)
+        guard supportsHaptics else { return }
+        UIImpactFeedbackGenerator(style: style).impactOccurred()
+        #endif
     }
 }
 

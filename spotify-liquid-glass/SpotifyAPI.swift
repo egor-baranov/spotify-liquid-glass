@@ -9,33 +9,62 @@ enum SpotifyAPIError: Error {
 }
 
 struct SpotifyAuthConfiguration {
-    let clientID: String = "<#Spotify Client ID#>"
-    let clientSecret: String = "<#Spotify Client Secret#>"
+    static let clientID: String = "b39c40971d754da5b8104cfc3219470b"
+    static let clientSecret: String = "f369d980c86f433aa8284e3f1fbf9a7f"
+    static let redirectURI: String = "spotify-liquid-glass://auth"
+}
+
+struct SpotifyAccessToken: Decodable {
+    let accessToken: String
+    let tokenType: String
+    let expiresIn: Int
+    let expiration: Date
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case tokenType = "token_type"
+        case expiresIn = "expires_in"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        accessToken = try container.decode(String.self, forKey: .accessToken)
+        tokenType = try container.decode(String.self, forKey: .tokenType)
+        expiresIn = try container.decode(Int.self, forKey: .expiresIn)
+        expiration = Date().addingTimeInterval(TimeInterval(expiresIn))
+    }
+}
+
+struct TokenExchangeResponse: Decodable {
+    let access_token: String
+    let token_type: String
+    let expires_in: Int
+    let refresh_token: String?
 }
 
 final class SpotifyAuthManager {
     static let shared = SpotifyAuthManager()
-    private let configuration = SpotifyAuthConfiguration()
     private var cachedToken: SpotifyAccessToken?
 
     private init() {}
 
     func validAccessToken() async throws -> String {
         if let token = cachedToken, token.expiration > Date().addingTimeInterval(60) {
-            return token.value
+            return token.accessToken
         }
         return try await requestAccessToken()
     }
 
     private func requestAccessToken() async throws -> String {
-        guard !configuration.clientID.contains("<#"), !configuration.clientSecret.contains("<#") else {
+        guard !SpotifyAuthConfiguration.clientID.isEmpty,
+              !SpotifyAuthConfiguration.clientSecret.isEmpty else {
             throw SpotifyAPIError.missingCredentials
         }
 
         var request = URLRequest(url: URL(string: "https://accounts.spotify.com/api/token")!)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        let credentials = "\(configuration.clientID):\(configuration.clientSecret)"
+        let credentials = "\(SpotifyAuthConfiguration.clientID):\(SpotifyAuthConfiguration.clientSecret)"
         guard let data = credentials.data(using: .utf8) else { throw SpotifyAPIError.missingCredentials }
         request.setValue("Basic \(data.base64EncodedString())", forHTTPHeaderField: "Authorization")
         request.httpBody = "grant_type=client_credentials".data(using: .utf8)
@@ -47,24 +76,17 @@ final class SpotifyAuthManager {
 
         let token = try JSONDecoder().decode(SpotifyAccessToken.self, from: responseData)
         cachedToken = token
-        return token.value
+        return token.accessToken
     }
-}
-
-struct SpotifyAccessToken: Codable {
-    let access_token: String
-    let token_type: String
-    let expires_in: Int
-
-    var value: String { access_token }
-    var expiration: Date { Date().addingTimeInterval(TimeInterval(expires_in)) }
 }
 
 final class SpotifyAPIClient {
     static let shared = SpotifyAPIClient()
     private let authManager = SpotifyAuthManager.shared
 
-    func fetchFeaturedPlaylists(limit: Int = 6) async throws -> [SpotifyRemotePlaylist] {
+    private init() {}
+
+    func fetchFeaturedPlaylists(limit: Int = 12) async throws -> [SpotifyRemotePlaylist] {
         let token = try await authManager.validAccessToken()
         var components = URLComponents(string: "https://api.spotify.com/v1/browse/featured-playlists")!
         components.queryItems = [
@@ -78,8 +100,78 @@ final class SpotifyAPIClient {
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw SpotifyAPIError.invalidResponse
         }
-        let decoded = try JSONDecoder().decode(SpotifyFeaturedPlaylistsResponse.self, from: data)
-        return decoded.playlists.items
+        return try JSONDecoder().decode(SpotifyFeaturedPlaylistsResponse.self, from: data).playlists.items
+    }
+
+    func fetchRecommendations(limit: Int = 6) async throws -> [SpotifyTrack] {
+        let token = try await authManager.validAccessToken()
+        var components = URLComponents(string: "https://api.spotify.com/v1/recommendations")!
+        components.queryItems = [
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "seed_genres", value: "pop")
+        ]
+        var request = URLRequest(url: components.url!)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SpotifyAPIError.invalidResponse
+        }
+        return try JSONDecoder().decode(SpotifyRecommendationResponse.self, from: data).tracks
+    }
+
+    func fetchNewReleases(limit: Int = 3) async throws -> [SpotifyAlbum] {
+        let token = try await authManager.validAccessToken()
+        var components = URLComponents(string: "https://api.spotify.com/v1/browse/new-releases")!
+        components.queryItems = [
+            URLQueryItem(name: "country", value: "US"),
+            URLQueryItem(name: "limit", value: String(limit))
+        ]
+        var request = URLRequest(url: components.url!)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SpotifyAPIError.invalidResponse
+        }
+        return try JSONDecoder().decode(SpotifyNewReleasesResponse.self, from: data).albums.items
+    }
+
+    func fetchUserPlaylists(accessToken: String, limit: Int = 50) async throws -> [SpotifyRemotePlaylist] {
+        var components = URLComponents(string: "https://api.spotify.com/v1/me/playlists")!
+        components.queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        var request = URLRequest(url: components.url!)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SpotifyAPIError.invalidResponse
+        }
+        return try JSONDecoder().decode(SpotifyPlaylistContainer.self, from: data).items
+    }
+
+    func fetchCurrentUserProfile(accessToken: String) async throws -> SpotifyUserProfile {
+        var request = URLRequest(url: URL(string: "https://api.spotify.com/v1/me")!)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SpotifyAPIError.invalidResponse
+        }
+        return try JSONDecoder().decode(SpotifyUserProfile.self, from: data)
+    }
+
+    func fetchPlaylistTracks(id: String, accessToken: String, limit: Int = 100) async throws -> [SpotifyTrack] {
+        var components = URLComponents(string: "https://api.spotify.com/v1/playlists/\(id)/tracks")!
+        components.queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        var request = URLRequest(url: components.url!)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SpotifyAPIError.invalidResponse
+        }
+        let decoded = try JSONDecoder().decode(SpotifyPlaylistTracksResponse.self, from: data)
+        return decoded.items.compactMap { $0.track }
     }
 }
 
@@ -91,12 +183,68 @@ struct SpotifyPlaylistContainer: Decodable {
     let items: [SpotifyRemotePlaylist]
 }
 
+struct SpotifyImage: Decodable {
+    let url: String?
+    let width: Int?
+    let height: Int?
+}
+
 struct SpotifyRemotePlaylist: Decodable {
     struct Owner: Decodable { let display_name: String? }
     let id: String
     let name: String
     let description: String?
     let owner: Owner
+    let images: [SpotifyImage]?
+}
+
+struct SpotifyRecommendationResponse: Decodable {
+    let tracks: [SpotifyTrack]
+}
+
+struct SpotifyTrack: Decodable {
+    struct Artist: Decodable { let name: String }
+    let id: String
+    let name: String
+    let artists: [Artist]
+    let album: SpotifyAlbumSummary
+    let duration_ms: Int
+}
+
+struct SpotifyAlbumSummary: Decodable {
+    let name: String
+    let images: [SpotifyImage]?
+}
+
+struct SpotifyNewReleasesResponse: Decodable {
+    let albums: SpotifyAlbumContainer
+}
+
+struct SpotifyAlbumContainer: Decodable {
+    let items: [SpotifyAlbum]
+}
+
+struct SpotifyAlbum: Decodable {
+    struct Artist: Decodable { let name: String }
+    let name: String
+    let artists: [Artist]
+    let images: [SpotifyImage]?
+}
+
+struct SpotifyPlaylistTracksResponse: Decodable {
+    struct Item: Decodable {
+        let track: SpotifyTrack?
+    }
+    let items: [Item]
+}
+
+struct SpotifyUserProfile: Decodable {
+    let display_name: String?
+    let images: [SpotifyUserImage]?
+}
+
+struct SpotifyUserImage: Decodable {
+    let url: String?
 }
 
 @MainActor
@@ -105,6 +253,8 @@ final class SpotifyDataProvider: ObservableObject {
     @Published var dailyMixes: [Playlist] = []
     @Published var quickPicks: [Playlist] = []
     @Published var trendingSongs: [Song] = []
+    @Published var releaseHighlight: Song?
+    @Published var userPlaylists: [Playlist] = []
 
     private let api = SpotifyAPIClient.shared
 
@@ -114,25 +264,46 @@ final class SpotifyDataProvider: ObservableObject {
 
     func refreshHome() async {
         do {
-            let remote = try await api.fetchFeaturedPlaylists(limit: 6)
-            let playlists = remote.map { $0.asPlaylist }
+            async let playlistsRequest = api.fetchFeaturedPlaylists(limit: 12)
+            async let recommendationsRequest = api.fetchRecommendations(limit: 6)
+            async let releasesRequest = api.fetchNewReleases(limit: 3)
+
+            let (remotePlaylists, recommendedTracks, newReleases) = try await (
+                playlistsRequest, recommendationsRequest, releasesRequest
+            )
+
+            let playlists = remotePlaylists.map { $0.asPlaylist }
             dailyMixes = playlists
-            quickPicks = playlists
-            heroSong = playlists.first.map { playlist in
-                Song(
-                    title: playlist.title,
-                    artist: playlist.subtitle,
-                    tagline: playlist.descriptor,
-                    duration: "3:30",
-                    colors: playlist.colors
-                )
+            if playlists.count > 1 {
+                quickPicks = Array(playlists.dropFirst()).shuffled().prefix(6).map { $0 }
+            } else {
+                quickPicks = playlists
             }
-            trendingSongs = DemoData.trendingSongs
+
+            let recommendedSongs = recommendedTracks.map { $0.asSong }
+            trendingSongs = recommendedSongs
+            heroSong = recommendedSongs.first ?? newReleases.first?.asSong ?? DemoData.heroSong
+            releaseHighlight = newReleases.first?.asSong ?? heroSong
         } catch {
             dailyMixes = DemoData.dailyMixes
             quickPicks = DemoData.quickPicks
             trendingSongs = DemoData.trendingSongs
             heroSong = DemoData.heroSong
+            releaseHighlight = DemoData.heroSong
+        }
+    }
+
+    func refreshUserContent(accessToken: String?) async {
+        guard let token = accessToken else {
+            userPlaylists = []
+            return
+        }
+
+        do {
+            let remote = try await api.fetchUserPlaylists(accessToken: token, limit: 50)
+            userPlaylists = remote.map { $0.asPlaylist }
+        } catch {
+            userPlaylists = []
         }
     }
 }
@@ -140,11 +311,48 @@ final class SpotifyDataProvider: ObservableObject {
 private extension SpotifyRemotePlaylist {
     var asPlaylist: Playlist {
         Playlist(
+            spotifyID: id,
             title: name,
             subtitle: owner.display_name ?? "Spotify",
             descriptor: description ?? "Featured playlist",
-            colors: ColorPalette.gradient(for: id)
+            colors: ColorPalette.gradient(for: id),
+            imageURL: images?.first?.url.flatMap(URL.init(string:))
         )
+    }
+}
+
+extension SpotifyTrack {
+    var asSong: Song {
+        Song(
+            title: name,
+            artist: artists.first?.name ?? "Unknown Artist",
+            tagline: album.name,
+            duration: duration_ms.formattedTime,
+            colors: ColorPalette.gradient(for: name),
+            artworkURL: album.images?.first?.url.flatMap(URL.init(string:))
+        )
+    }
+}
+
+extension SpotifyAlbum {
+    var asSong: Song {
+        Song(
+            title: name,
+            artist: artists.first?.name ?? "Unknown Artist",
+            tagline: "New release",
+            duration: "4:00",
+            colors: ColorPalette.gradient(for: name),
+            artworkURL: images?.first?.url.flatMap(URL.init(string:))
+        )
+    }
+}
+
+private extension Int {
+    var formattedTime: String {
+        let totalSeconds = self / 1000
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%d:%02d", minutes, seconds)
     }
 }
 
@@ -158,5 +366,77 @@ enum ColorPalette {
         ]
         let index = abs(seed.hashValue) % palettes.count
         return palettes[index]
+    }
+}
+
+extension Playlist {
+    func asLibraryCollection() -> LibraryCollection {
+        LibraryCollection(
+            title: title,
+            subtitle: subtitle,
+            meta: descriptor,
+            icon: "music.note",
+            colors: colors,
+            type: .playlists,
+            isPinned: false,
+            imageURL: imageURL,
+            playlist: self
+        )
+    }
+}
+
+// MARK: - User Session
+
+final class SpotifyUserSession: ObservableObject {
+    static let shared = SpotifyUserSession()
+
+    @Published private(set) var accessToken: String?
+    @Published private(set) var refreshToken: String?
+    @Published private(set) var expiration: Date?
+    @Published private(set) var displayName: String?
+    @Published private(set) var avatarURL: URL?
+
+    var isLoggedIn: Bool { accessToken != nil }
+
+    private let storage = UserDefaults.standard
+
+    private init() {
+        accessToken = storage.string(forKey: "spotify_access_token")
+        refreshToken = storage.string(forKey: "spotify_refresh_token")
+        expiration = storage.object(forKey: "spotify_token_expiration") as? Date
+        displayName = storage.string(forKey: "spotify_display_name")
+        if let urlString = storage.string(forKey: "spotify_avatar_url") {
+            avatarURL = URL(string: urlString)
+        }
+    }
+
+    func update(with response: TokenExchangeResponse) {
+        accessToken = response.access_token
+        refreshToken = response.refresh_token ?? refreshToken
+        expiration = Date().addingTimeInterval(TimeInterval(response.expires_in))
+        storage.set(accessToken, forKey: "spotify_access_token")
+        storage.set(refreshToken, forKey: "spotify_refresh_token")
+        storage.set(expiration, forKey: "spotify_token_expiration")
+    }
+
+    func updateProfile(_ profile: SpotifyUserProfile) {
+        displayName = profile.display_name
+        let urlString = profile.images?.first?.url
+        avatarURL = urlString.flatMap(URL.init(string:))
+        storage.set(displayName, forKey: "spotify_display_name")
+        storage.set(urlString, forKey: "spotify_avatar_url")
+    }
+
+    func logout() {
+        accessToken = nil
+        refreshToken = nil
+        expiration = nil
+        storage.removeObject(forKey: "spotify_access_token")
+        storage.removeObject(forKey: "spotify_refresh_token")
+        storage.removeObject(forKey: "spotify_token_expiration")
+        displayName = nil
+        avatarURL = nil
+        storage.removeObject(forKey: "spotify_display_name")
+        storage.removeObject(forKey: "spotify_avatar_url")
     }
 }
