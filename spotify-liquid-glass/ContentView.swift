@@ -8,6 +8,8 @@
 import SwiftUI
 import UIKit
 import CoreHaptics
+import Combine
+import AVFoundation
 
 private let likedSongsGradientColors: [Color] = [
     Color(red: 0.54, green: 0.32, blue: 0.98),
@@ -18,12 +20,13 @@ struct ContentView: View {
     @State private var selectedTab: AppTab = .home
     @State private var homePath = NavigationPath()
     @State private var libraryPath = NavigationPath()
-    @State private var nowPlaying: Song?
+    @StateObject private var playbackManager = PlaybackManager.shared
     @State private var showPlayerFullScreen = false
     @State private var playerDetent: PresentationDetent = .fraction(1.0)
     @StateObject private var dataProvider = SpotifyDataProvider()
     @State private var showingAccount = false
     @StateObject private var userSession = SpotifyUserSession.shared
+    @StateObject private var remotePlayback = SpotifyPlaybackController.shared
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -96,16 +99,32 @@ struct ContentView: View {
             .toolbarBackground(.ultraThinMaterial, for: .tabBar)
             .toolbarColorScheme(.dark, for: .tabBar)
 
-            if let song = nowPlaying {
-                MiniPlayerView(
-                    song: song,
+            if remotePlayback.currentSong != nil {
+                RemoteMiniPlayerView(
+                    remote: remotePlayback,
                     onExpand: {
                         Haptics.impact(.light)
                         showPlayerFullScreen = true
                     },
                     onClose: {
                         withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                            nowPlaying = nil
+                            remotePlayback.disconnect()
+                            showPlayerFullScreen = false
+                        }
+                    }
+                )
+                .padding(.horizontal, 24)
+                .padding(.bottom, miniPlayerBottomPadding)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            } else if playbackManager.currentSong != nil {
+                MiniPlayerView(
+                    playback: playbackManager,
+                    onExpand: {
+                        Haptics.impact(.light)
+                        showPlayerFullScreen = true
+                    },
+                    onClose: {
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
                             showPlayerFullScreen = false
                         }
                     }
@@ -136,22 +155,33 @@ struct ContentView: View {
         .ignoresSafeArea()
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showPlayerFullScreen) {
-            if let song = nowPlaying {
-                PlayerFullScreenView(song: song) {
-                    showPlayerFullScreen = false
-                }
-                .presentationDetents([.fraction(1.0), .fraction(0.85)], selection: $playerDetent)
-                .presentationDragIndicator(.visible)
-                .onAppear {
-                    playerDetent = .fraction(1.0)
-                }
-            }
+            sheetContentForPlayer()
         }
         .sheet(isPresented: $showingAccount) {
             AccountView {
                 showingAccount = false
             }
             .environmentObject(userSession)
+        }
+    }
+
+    @ViewBuilder
+    private func sheetContentForPlayer() -> some View {
+        Group {
+            if remotePlayback.currentSong != nil {
+                RemotePlayerFullScreenView(remote: remotePlayback) {
+                    showPlayerFullScreen = false
+                }
+            } else {
+                PlayerFullScreenView(playback: playbackManager) {
+                    showPlayerFullScreen = false
+                }
+            }
+        }
+        .presentationDetents([.fraction(1.0), .fraction(0.85)], selection: $playerDetent)
+        .presentationDragIndicator(.visible)
+        .onAppear {
+            playerDetent = .fraction(1.0)
         }
     }
 
@@ -171,8 +201,18 @@ struct ContentView: View {
     }
 
     private func handleSongSelection(_ song: Song) {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-            nowPlaying = song
+        debugLog("User tapped song '\(song.title)' URI=\(song.spotifyURI ?? "nil")")
+        Task {
+            let token = userSession.accessToken
+            let playedRemotely = await remotePlayback.playIfPossible(song: song, accessToken: token)
+            debugLog(playedRemotely ? "Handed off to Spotify App Remote." : "App Remote unavailable, using preview playback.")
+            if !playedRemotely {
+                await playbackManager.play(song: song)
+            } else {
+                await MainActor.run {
+                    playbackManager.stop()
+                }
+            }
         }
     }
 
@@ -202,15 +242,17 @@ struct ContentView: View {
         if playlist.isLikedSongs {
             let cached = await MainActor.run { dataProvider.likedSongs }
             if !cached.isEmpty {
+                debugLog("Using cached liked songs (\(cached.count))")
                 return cached
             }
 
             guard let token = await userSession.validUserAccessToken() ?? userSession.accessToken else {
-                debugPrint("[LikedSongs] Missing access token; returning cached results.")
+                debugLog("Liked songs fetch aborted: missing user token.")
                 return cached
             }
 
             await dataProvider.loadLikedSongs(token: token, reset: true)
+            debugLog("Fetched liked songs from Spotify (\(dataProvider.likedSongs.count)).")
             return await MainActor.run { dataProvider.likedSongs }
         }
 
@@ -1100,65 +1142,127 @@ struct PlaylistSongRow: View {
 }
 
 struct MiniPlayerView: View {
-    let song: Song
+    @ObservedObject var playback: PlaybackManager
+    let onExpand: () -> Void
+    let onClose: () -> Void
+
+    private var song: Song? { playback.currentSong }
+
+    var body: some View {
+        if let song {
+            HStack(spacing: 12) {
+                CoverImageView(
+                    imageURL: song.artworkURL,
+                    size: 44,
+                    cornerRadius: 12,
+                    gradient: song.gradient,
+                    overlayIcon: song.artworkURL == nil ? "music.note" : nil
+                )
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(song.title)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                    Text(song.artist)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.7))
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                Button {
+                    playback.togglePlayPause()
+                    Haptics.impact(.light)
+                } label: {
+                    Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.headline.weight(.bold))
+                }
+
+                Button {
+                    playback.stop()
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.headline)
+                }
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.white.opacity(0.15), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.35), radius: 12, y: 8)
+            .onTapGesture {
+                onExpand()
+            }
+        }
+    }
+}
+
+struct RemoteMiniPlayerView: View {
+    @ObservedObject var remote: SpotifyPlaybackController
     let onExpand: () -> Void
     let onClose: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(song.gradient)
-                .frame(width: 42, height: 42)
-                .overlay(
-                    Image(systemName: "waveform.path.ecg")
-                        .font(.subheadline.weight(.bold))
-                        .foregroundStyle(.white.opacity(0.9))
+        if let song = remote.currentSong {
+            HStack(spacing: 12) {
+                CoverImageView(
+                    imageURL: song.artworkURL,
+                    uiImage: remote.currentArtwork,
+                    size: 44,
+                    cornerRadius: 12,
+                    gradient: song.gradient,
+                    overlayIcon: (song.artworkURL == nil && remote.currentArtwork == nil) ? "music.note" : nil
                 )
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(song.title)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                Text(song.artist)
-                    .font(.caption2)
-                    .foregroundStyle(.white.opacity(0.7))
-                    .lineLimit(1)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(song.title)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                    Text(song.artist)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.7))
+                        .lineLimit(1)
+                }
+                Spacer()
+                Button {
+                    remote.togglePlayPause()
+                    Haptics.impact(.light)
+                } label: {
+                    Image(systemName: remote.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.headline.weight(.bold))
+                }
+                Button {
+                    remote.disconnect()
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.headline)
+                }
             }
-
-            Spacer()
-
-            Button {
-                // placeholder for playback toggle
-                Haptics.impact(.light)
-            } label: {
-                Image(systemName: "play.fill")
-                    .font(.headline.weight(.bold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.white.opacity(0.15), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.35), radius: 12, y: 8)
+            .onTapGesture {
+                onExpand()
             }
-
-            Button(action: onClose) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.headline)
-            }
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial, in: Capsule())
-        .overlay(
-            Capsule()
-                .strokeBorder(Color.white.opacity(0.15), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.35), radius: 12, y: 8)
-        .onTapGesture {
-            onExpand()
         }
     }
 }
 
 struct PlayerFullScreenView: View {
-    let song: Song
+    @ObservedObject var playback: PlaybackManager
     let onClose: () -> Void
-    @State private var progress: Double = 0.25
 
     var body: some View {
         ZStack {
@@ -1170,7 +1274,7 @@ struct PlayerFullScreenView: View {
                 startPoint: .top,
                 endPoint: .bottom
             )
-                .ignoresSafeArea()
+            .ignoresSafeArea()
 
             VStack(spacing: 28) {
                 Capsule()
@@ -1178,43 +1282,56 @@ struct PlayerFullScreenView: View {
                     .frame(width: 88, height: 5)
                     .padding(.top, 14)
 
+                HStack {
+                    Spacer()
+                    Button(action: onClose) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.white.opacity(0.8))
+                    }
+                }
+                .padding(.horizontal, 16)
+
                 Spacer()
 
-                RoundedRectangle(cornerRadius: 32, style: .continuous)
-                    .fill(Color.white.opacity(0.08))
-                    .frame(height: 320)
-                    .overlay(
-                        Image(systemName: "music.note")
-                            .font(.system(size: 64, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.4))
+                if let song = playback.currentSong {
+                    CoverImageView(
+                        imageURL: song.artworkURL,
+                        size: 320,
+                        cornerRadius: 40,
+                        gradient: song.gradient,
+                        overlayIcon: song.artworkURL == nil ? "music.note" : nil
                     )
-
-                VStack(spacing: 8) {
-                    Text(song.title)
-                        .font(.title2.weight(.semibold))
-                        .foregroundStyle(.white)
-                    Text(song.artist)
-                        .font(.body)
-                        .foregroundStyle(.white.opacity(0.7))
+                    VStack(spacing: 8) {
+                        Text(song.title)
+                            .font(.title2.weight(.semibold))
+                            .foregroundStyle(.white)
+                        Text(song.artist)
+                            .font(.body)
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
+                    .padding(.top, 10)
+                } else {
+                    Spacer().frame(height: 320)
                 }
-                .padding(.top, 10)
 
                 VStack(spacing: 18) {
-                    Capsule()
-                        .fill(Color.white.opacity(0.35))
-                        .frame(height: 6)
-                        .padding(.horizontal, 12)
-                        .overlay(
-                            Capsule()
-                                .fill(Color.white)
-                                .frame(width: 200, height: 6)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        )
+                    Slider(
+                        value: Binding(
+                            get: { playback.progress },
+                            set: { playback.seek(to: $0) }
+                        ),
+                        in: 0...1
+                    )
+                    .accentColor(.white)
+                    .padding(.horizontal, 16)
+                    .disabled(playback.duration == 0)
+                    .opacity(playback.duration == 0 ? 0.5 : 1)
 
                     HStack {
-                        Text(timeString(progress * 240))
+                        Text(playback.elapsedText)
                         Spacer()
-                        Text(timeString(240))
+                        Text(playback.durationText)
                     }
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.6))
@@ -1223,7 +1340,9 @@ struct PlayerFullScreenView: View {
 
                 HStack(spacing: 28) {
                     GlassControlButton(systemName: "backward.fill")
-                    GlassControlButton(systemName: progress > 0.01 ? "pause.fill" : "play.fill", isPrimary: true)
+                    GlassControlButton(systemName: playback.isPlaying ? "pause.fill" : "play.fill", isPrimary: true) {
+                        playback.togglePlayPause()
+                    }
                     GlassControlButton(systemName: "forward.fill")
                 }
                 .padding(.top, 16)
@@ -1241,11 +1360,106 @@ struct PlayerFullScreenView: View {
             .padding(.bottom, 52)
         }
     }
+}
 
-    private func timeString(_ seconds: Double) -> String {
-        let minutes = Int(seconds) / 60
-        let secs = Int(seconds) % 60
-        return String(format: "%d:%02d", minutes, secs)
+struct RemotePlayerFullScreenView: View {
+    @ObservedObject var remote: SpotifyPlaybackController
+    let onClose: () -> Void
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(red: 0.16, green: 0.16, blue: 0.18),
+                    Color(red: 0.05, green: 0.05, blue: 0.07)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 28) {
+                Capsule()
+                    .fill(Color.white.opacity(0.3))
+                    .frame(width: 88, height: 5)
+                    .padding(.top, 14)
+                HStack {
+                    Spacer()
+                    Button(action: onClose) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.white.opacity(0.8))
+                    }
+                }
+                .padding(.horizontal, 16)
+
+                Spacer()
+
+                if let song = remote.currentSong {
+                    CoverImageView(
+                        imageURL: song.artworkURL,
+                        uiImage: remote.currentArtwork,
+                        size: 320,
+                        cornerRadius: 40,
+                        gradient: song.gradient,
+                        overlayIcon: (song.artworkURL == nil && remote.currentArtwork == nil) ? "music.note" : nil
+                    )
+                    VStack(spacing: 8) {
+                        Text(song.title)
+                            .font(.title2.weight(.semibold))
+                        Text(song.artist)
+                            .font(.body)
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
+                    .padding(.top, 10)
+                } else {
+                    Spacer().frame(height: 320)
+                }
+
+                VStack(spacing: 18) {
+                    Slider(
+                        value: Binding(
+                            get: {
+                                guard remote.trackDuration > 0 else { return 0 }
+                                return remote.playbackPosition / max(remote.trackDuration, 0.001)
+                            },
+                            set: { remote.seek(toProgress: $0) }
+                        ),
+                        in: 0...1
+                    )
+                    .accentColor(.white)
+                    .padding(.horizontal, 16)
+                    .disabled(remote.trackDuration == 0)
+                    .opacity(remote.trackDuration == 0 ? 0.5 : 1)
+
+                    HStack {
+                        Text(remote.playbackPosition.asTimeString())
+                        Spacer()
+                        Text(remote.trackDuration.asTimeString())
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.6))
+                }
+                .padding(.horizontal, 36)
+
+                HStack(spacing: 28) {
+                    GlassControlButton(systemName: "backward.fill") {
+                        remote.skipToPrevious()
+                    }
+                    GlassControlButton(systemName: remote.isPlaying ? "pause.fill" : "play.fill", isPrimary: true) {
+                        remote.togglePlayPause()
+                    }
+                    GlassControlButton(systemName: "forward.fill") {
+                        remote.skipToNext()
+                    }
+                }
+                .padding(.top, 16)
+
+                Spacer()
+            }
+            .padding(.horizontal, 28)
+            .padding(.bottom, 52)
+        }
     }
 }
 
@@ -1253,10 +1467,12 @@ struct GlassControlButton: View {
     let systemName: String
     var size: CGFloat = 64
     var isPrimary: Bool = false
+    var action: (() -> Void)? = nil
 
     var body: some View {
         Button {
             Haptics.impact(.light)
+            action?()
         } label: {
             Image(systemName: systemName)
                 .font(.system(size: isPrimary ? 26 : 20, weight: .bold))
@@ -1274,6 +1490,204 @@ struct GlassControlButton: View {
         }
         .buttonStyle(.plain)
     }
+}
+
+// MARK: - Playback
+
+final class PlaybackManager: ObservableObject {
+    static let shared = PlaybackManager()
+
+    @Published private(set) var currentSong: Song?
+    @Published private(set) var isPlaying = false
+    @Published private(set) var progress: Double = 0
+    @Published private(set) var currentTime: Double = 0
+    @Published private(set) var duration: Double = 0
+
+    @MainActor private var player: AVPlayer?
+    @MainActor private var timeObserver: Any?
+    @MainActor private var playbackEndObserver: NSObjectProtocol?
+
+    deinit {
+        removeTimeObserver()
+        removePlaybackEndObserver()
+    }
+
+    var elapsedText: String {
+        currentTime.asTimeString()
+    }
+
+    var durationText: String {
+        duration.asTimeString()
+    }
+
+    @MainActor
+    func play(song: Song) async {
+        guard let url = await resolvePreviewURL(for: song) else {
+            debugLog("Preview playback unavailable for \(song.title)")
+            return
+        }
+        debugLog("Starting preview playback for \(song.title) @ \(url.absoluteString)")
+
+        if currentSong?.id != song.id {
+            preparePlayer(with: url)
+            currentSong = song
+        }
+
+        player?.play()
+        isPlaying = true
+    }
+
+    @MainActor
+    func togglePlayPause() {
+        guard player != nil else { return }
+        if isPlaying {
+            player?.pause()
+        } else {
+            player?.play()
+        }
+        isPlaying.toggle()
+    }
+
+    @MainActor
+    func stop() {
+        player?.pause()
+        removeTimeObserver()
+        removePlaybackEndObserver()
+        player = nil
+        currentSong = nil
+        isPlaying = false
+        progress = 0
+        currentTime = 0
+        duration = 0
+        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+    }
+
+    @MainActor
+    func seek(to progress: Double) {
+        guard let player = player, duration > 0 else { return }
+        let seconds = progress * duration
+        let time = CMTime(seconds: seconds, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+        player.seek(to: time)
+        currentTime = seconds
+        self.progress = progress
+    }
+
+    private func resolvePreviewURL(for song: Song) async -> URL? {
+        if let direct = song.audioPreviewURL {
+            return direct
+        }
+        return await PreviewResolver.shared.resolvePreviewURL(for: song)
+    }
+
+    private func preparePlayer(with url: URL) {
+        removeTimeObserver()
+        removePlaybackEndObserver()
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+        try? AVAudioSession.sharedInstance().setActive(true)
+        let item = AVPlayerItem(url: url)
+        player = AVPlayer(playerItem: item)
+        duration = item.asset.duration.seconds.isFinite ? item.asset.duration.seconds : 0
+        currentTime = 0
+        progress = 0
+        addTimeObserver()
+        playbackEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            self?.player?.seek(to: .zero)
+            self?.isPlaying = false
+            self?.progress = 0
+            self?.currentTime = 0
+        }
+    }
+
+    private func addTimeObserver() {
+        guard let player = player else { return }
+        let interval = CMTime(seconds: 0.5, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            guard let self = self else { return }
+            let seconds = time.seconds
+            self.currentTime = seconds
+            if self.duration > 0 {
+                self.progress = seconds / self.duration
+            } else {
+                self.progress = 0
+            }
+        }
+    }
+
+    private func removeTimeObserver() {
+        if let observer = timeObserver {
+            player?.removeTimeObserver(observer)
+            timeObserver = nil
+        }
+    }
+
+    private func removePlaybackEndObserver() {
+        if let observer = playbackEndObserver {
+            NotificationCenter.default.removeObserver(observer)
+            playbackEndObserver = nil
+        }
+    }
+}
+
+
+private extension Double {
+    func asTimeString() -> String {
+        guard self.isFinite else { return "0:00" }
+        let totalSeconds = Int(self)
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+extension Int {
+    func asTimeString() -> String {
+        let minutes = self / 60
+        let seconds = self % 60
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+actor PreviewResolver {
+    static let shared = PreviewResolver()
+
+    private var cache: [String: URL] = [:]
+
+    func resolvePreviewURL(for song: Song) async -> URL? {
+        if let cached = cache[song.id] {
+            return cached
+        }
+
+        let query = "\(song.artist) \(song.title)"
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://itunes.apple.com/search?term=\(encoded)&limit=1&media=music") else {
+            return nil
+        }
+
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+            let result = try JSONDecoder().decode(ITunesSearchResponse.self, from: data)
+            guard let previewString = result.results.first?.previewUrl,
+                  let previewURL = URL(string: previewString) else {
+                return nil
+            }
+            cache[song.id] = previewURL
+            return previewURL
+        } catch {
+            return nil
+        }
+    }
+}
+
+private struct ITunesSearchResponse: Decodable {
+    struct Result: Decodable {
+        let previewUrl: String?
+    }
+    let results: [Result]
 }
 
 
@@ -1615,28 +2029,36 @@ struct ProfileBubble: View {
 // MARK: - Data Models
 
 struct Song: Identifiable, Hashable {
-    let id = UUID()
+    let id: String
     let title: String
     let artist: String
     let tagline: String
     let duration: String
     let colors: [Color]
     let artworkURL: URL?
+    let audioPreviewURL: URL?
+    let spotifyURI: String?
 
     init(
+        id: String = UUID().uuidString,
         title: String,
         artist: String,
         tagline: String,
         duration: String,
         colors: [Color],
-        artworkURL: URL? = nil
+        artworkURL: URL? = nil,
+        audioPreviewURL: URL? = nil,
+        spotifyURI: String? = nil
     ) {
+        self.id = id
         self.title = title
         self.artist = artist
         self.tagline = tagline
         self.duration = duration
         self.colors = colors
         self.artworkURL = artworkURL
+        self.audioPreviewURL = audioPreviewURL
+        self.spotifyURI = spotifyURI
     }
 
     var gradient: LinearGradient {
@@ -2235,6 +2657,7 @@ struct HomePlaylistGrid: View {
 
 struct CoverImageView: View {
     let imageURL: URL?
+    var uiImage: UIImage? = nil
     let size: CGFloat
     let cornerRadius: CGFloat
     let gradient: LinearGradient
@@ -2245,7 +2668,13 @@ struct CoverImageView: View {
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(gradient)
 
-            if let url = imageURL {
+            if let uiImage {
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: size, height: size)
+                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            } else if let url = imageURL {
                 AsyncImage(url: url) { phase in
                     switch phase {
                     case .success(let image):

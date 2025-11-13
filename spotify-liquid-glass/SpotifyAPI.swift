@@ -259,10 +259,12 @@ struct SpotifyRecommendationResponse: Decodable {
 struct SpotifyTrack: Decodable {
     struct Artist: Decodable { let name: String }
     let id: String
+    let uri: String?
     let name: String
     let artists: [Artist]
     let album: SpotifyAlbumSummary
     let duration_ms: Int
+    let preview_url: String?
 }
 
 struct SpotifyAlbumSummary: Decodable {
@@ -400,7 +402,9 @@ final class SpotifyDataProvider: ObservableObject {
             if reset {
                 likedSongs = songs
             } else {
-                likedSongs.append(contentsOf: songs)
+                let existingIDs = Set(likedSongs.map(\.id))
+                let newSongs = songs.filter { !existingIDs.contains($0.id) }
+                likedSongs.append(contentsOf: newSongs)
             }
 
             likedSongsTotal = response.total
@@ -426,7 +430,7 @@ final class SpotifyDataProvider: ObservableObject {
         await loadLikedSongs(token: accessToken, reset: false)
     }
 
-    func shouldLoadMoreLikedSongs(currentSongID: UUID) -> Bool {
+    func shouldLoadMoreLikedSongs(currentSongID: String) -> Bool {
         guard let index = likedSongs.firstIndex(where: { $0.id == currentSongID }) else { return false }
         guard likedSongsNextOffset != nil else { return false }
         guard !isLoadingLikedSongs else { return false }
@@ -450,12 +454,15 @@ private extension SpotifyRemotePlaylist {
 extension SpotifyTrack {
     var asSong: Song {
         Song(
+            id: id,
             title: name,
             artist: artists.first?.name ?? "Unknown Artist",
             tagline: album.name,
             duration: duration_ms.formattedTime,
             colors: ColorPalette.gradient(for: name),
-            artworkURL: album.images?.first?.url.flatMap(URL.init(string:))
+            artworkURL: album.images?.first?.url.flatMap(URL.init(string:)),
+            audioPreviewURL: preview_url.flatMap(URL.init(string:)),
+            spotifyURI: uri
         )
     }
 }
@@ -596,12 +603,16 @@ final class SpotifyUserSession: ObservableObject {
 
     private func refreshAccessToken() async -> String? {
         guard let refreshToken = refreshToken else { return nil }
-        guard let url = URL(string: "http://127.0.0.1:5001/refresh") else { return nil }
 
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: URL(string: "https://accounts.spotify.com/api/token")!)
         request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["refresh_token": refreshToken], options: [])
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let body = [
+            "grant_type=refresh_token",
+            "refresh_token=\(refreshToken)",
+            "client_id=\(SpotifyAuthConfiguration.clientID)"
+        ].joined(separator: "&")
+        request.httpBody = body.data(using: .utf8)
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
