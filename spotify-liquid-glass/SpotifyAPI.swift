@@ -328,12 +328,23 @@ final class SpotifyDataProvider: ObservableObject {
     private let api = SpotifyAPIClient.shared
     private var likedSongsNextOffset: Int?
     private var isLoadingLikedSongs = false
+    private var likedSongsLoadingToken: String?
+    private var isRefreshingHome = false
+    private var isRefreshingUserContent = false
+    private var activeUserContentToken: String?
+    private var currentUserToken: String?
 
     init() {
         Task { await refreshHome() }
     }
 
     func refreshHome() async {
+        if isRefreshingHome {
+            debugLog("Home refresh skipped: request already running.")
+            return
+        }
+        isRefreshingHome = true
+        defer { isRefreshingHome = false }
         do {
             async let playlistsRequest = api.fetchFeaturedPlaylists(limit: 12)
             async let recommendationsRequest = api.fetchRecommendations(limit: 6)
@@ -356,47 +367,81 @@ final class SpotifyDataProvider: ObservableObject {
             heroSong = recommendedSongs.first ?? newReleases.first?.asSong ?? DemoData.heroSong
             releaseHighlight = newReleases.first?.asSong ?? heroSong
         } catch {
-            dailyMixes = DemoData.dailyMixes
-            quickPicks = DemoData.quickPicks
-            trendingSongs = DemoData.trendingSongs
-            heroSong = DemoData.heroSong
-            releaseHighlight = DemoData.heroSong
+            debugLog("Home refresh failed: \(error.localizedDescription)")
+            if dailyMixes.isEmpty {
+                dailyMixes = DemoData.dailyMixes
+            }
+            if quickPicks.isEmpty {
+                quickPicks = DemoData.quickPicks
+            }
+            if trendingSongs.isEmpty {
+                trendingSongs = DemoData.trendingSongs
+            }
+            if heroSong == nil {
+                heroSong = DemoData.heroSong
+            }
+            if releaseHighlight == nil {
+                releaseHighlight = DemoData.heroSong
+            }
         }
     }
 
     func refreshUserContent(accessToken: String?) async {
+        currentUserToken = accessToken
         guard let token = accessToken else {
-            userPlaylists = []
-            likedSongs = []
-            likedSongsTotal = 0
-            likedSongsNextOffset = nil
+            resetUserCollections()
             return
         }
 
+        if isRefreshingUserContent, activeUserContentToken == token {
+            debugLog("User content refresh already running for current token.")
+            return
+        }
+
+        isRefreshingUserContent = true
+        activeUserContentToken = token
+        defer {
+            if activeUserContentToken == token {
+                activeUserContentToken = nil
+            }
+            isRefreshingUserContent = false
+        }
+
         await fetchUserPlaylists(token: token)
+        guard tokenMatchesCurrentUser(token) else { return }
         await loadLikedSongs(token: token, reset: true)
     }
 
     private func fetchUserPlaylists(token: String) async {
         do {
             let remote = try await api.fetchUserPlaylists(accessToken: token, limit: 50)
+            guard tokenMatchesCurrentUser(token) else { return }
             userPlaylists = remote.map { $0.asPlaylist }
         } catch {
-            userPlaylists = []
+            guard tokenMatchesCurrentUser(token) else { return }
+            debugLog("Failed to fetch user playlists: \(error.localizedDescription)")
         }
     }
 
     func loadLikedSongs(token: String, reset: Bool) async {
-        if isLoadingLikedSongs { return }
+        guard tokenMatchesCurrentUser(token) else { return }
+        if isLoadingLikedSongs, likedSongsLoadingToken == token { return }
         if !reset, likedSongsNextOffset == nil { return }
 
         isLoadingLikedSongs = true
-        defer { isLoadingLikedSongs = false }
+        likedSongsLoadingToken = token
+        defer {
+            if likedSongsLoadingToken == token {
+                likedSongsLoadingToken = nil
+            }
+            isLoadingLikedSongs = false
+        }
 
         let offset = reset ? 0 : (likedSongsNextOffset ?? 0)
 
         do {
             let response = try await api.fetchLikedTracks(accessToken: token, limit: 50, offset: offset)
+            guard tokenMatchesCurrentUser(token) else { return }
             let songs = response.items.compactMap { $0.track?.asSong }
 
             if reset {
@@ -414,7 +459,8 @@ final class SpotifyDataProvider: ObservableObject {
                 likedSongsNextOffset = nil
             }
         } catch {
-            if reset {
+            debugLog("Failed to load liked songs: \(error.localizedDescription)")
+            if reset, likedSongs.isEmpty {
                 likedSongs = []
                 likedSongsTotal = 0
                 likedSongsNextOffset = nil
@@ -435,6 +481,20 @@ final class SpotifyDataProvider: ObservableObject {
         guard likedSongsNextOffset != nil else { return false }
         guard !isLoadingLikedSongs else { return false }
         return index >= max(likedSongs.count - 5, 0)
+    }
+
+    private func resetUserCollections() {
+        userPlaylists = []
+        likedSongs = []
+        likedSongsTotal = 0
+        likedSongsNextOffset = nil
+        activeUserContentToken = nil
+        likedSongsLoadingToken = nil
+        isLoadingLikedSongs = false
+    }
+
+    private func tokenMatchesCurrentUser(_ token: String) -> Bool {
+        currentUserToken == token
     }
 }
 

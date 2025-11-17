@@ -17,6 +17,7 @@ private let likedSongsGradientColors: [Color] = [
 ]
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var selectedTab: AppTab = .home
     @State private var homePath = NavigationPath()
     @State private var libraryPath = NavigationPath()
@@ -137,19 +138,24 @@ struct ContentView: View {
         .environmentObject(userSession)
         .environmentObject(dataProvider)
         .task {
-            await userSession.ensureProfileLoaded()
-            let token = await userSession.validUserAccessToken()
+            let token = await synchronizeRemotePlaybackSession()
             await dataProvider.refreshUserContent(accessToken: token)
         }
-        .onChange(of: userSession.accessToken) { token in
+        .onChange(of: userSession.accessToken) { _ in
             Task {
-                await userSession.ensureProfileLoaded()
-                if token != nil {
-                    let fresh = await userSession.validUserAccessToken()
-                    await dataProvider.refreshUserContent(accessToken: fresh)
-                } else {
-                    await dataProvider.refreshUserContent(accessToken: nil)
-                }
+                let token = await synchronizeRemotePlaybackSession()
+                await dataProvider.refreshUserContent(accessToken: token)
+            }
+        }
+        .onChange(of: scenePhase) { phase in
+            guard phase == .active else { return }
+            Task {
+                await synchronizeRemotePlaybackSession()
+            }
+        }
+        .onOpenURL { url in
+            if remotePlayback.handleIncomingURL(url) {
+                Task { await synchronizeRemotePlaybackSession() }
             }
         }
         .ignoresSafeArea()
@@ -203,7 +209,7 @@ struct ContentView: View {
     private func handleSongSelection(_ song: Song) {
         debugLog("User tapped song '\(song.title)' URI=\(song.spotifyURI ?? "nil")")
         Task {
-            let token = userSession.accessToken
+            let token = await userSession.validUserAccessToken()
             let playedRemotely = await remotePlayback.playIfPossible(song: song, accessToken: token)
             debugLog(playedRemotely ? "Handed off to Spotify App Remote." : "App Remote unavailable, using preview playback.")
             if !playedRemotely {
@@ -214,6 +220,17 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    @discardableResult
+    private func synchronizeRemotePlaybackSession() async -> String? {
+        await userSession.ensureProfileLoaded()
+        let token = await userSession.validUserAccessToken()
+        await MainActor.run {
+            remotePlayback.updateAccessToken(token)
+            remotePlayback.synchronizeWithCurrentPlaybackIfAvailable()
+        }
+        return token
     }
 
     private func handleLibraryCollectionSelection(_ collection: LibraryCollection) {
@@ -304,6 +321,7 @@ struct ContentView: View {
     private var likedSongsCollection: LibraryCollection? {
         guard let playlist = likedSongsPlaylist else { return nil }
         return LibraryCollection(
+            id: playlist.id,
             title: playlist.title,
             subtitle: playlist.subtitle,
             meta: playlist.descriptor,
@@ -322,11 +340,12 @@ struct ContentView: View {
             ? "Your favorites"
             : "\(dataProvider.likedSongs.count) liked tracks"
         return Playlist(
+            id: "liked-songs",
             title: "Liked Songs",
             subtitle: subtitle,
             descriptor: "Saved tracks",
             colors: likedSongsGradientColors,
-            imageURL: dataProvider.likedSongs.first?.artworkURL,
+            imageURL: nil,
             isLikedSongs: true
         )
     }
@@ -479,6 +498,7 @@ struct HomeView: View {
         let total = max(dataProvider.likedSongsTotal, dataProvider.likedSongs.count)
         let subtitle = total > 0 ? "\(total) liked tracks" : "Your favorites"
         return Playlist(
+            id: "liked-songs-placeholder",
             title: "Liked Songs",
             subtitle: subtitle,
             descriptor: "Saved tracks",
@@ -1506,10 +1526,12 @@ final class PlaybackManager: ObservableObject {
     @MainActor private var player: AVPlayer?
     @MainActor private var timeObserver: Any?
     @MainActor private var playbackEndObserver: NSObjectProtocol?
+    @MainActor private var playerItemStatusObserver: NSKeyValueObservation?
 
     deinit {
         removeTimeObserver()
         removePlaybackEndObserver()
+        removeStatusObserver()
     }
 
     var elapsedText: String {
@@ -1553,6 +1575,7 @@ final class PlaybackManager: ObservableObject {
         player?.pause()
         removeTimeObserver()
         removePlaybackEndObserver()
+        removeStatusObserver()
         player = nil
         currentSong = nil
         isPlaying = false
@@ -1565,11 +1588,12 @@ final class PlaybackManager: ObservableObject {
     @MainActor
     func seek(to progress: Double) {
         guard let player = player, duration > 0 else { return }
-        let seconds = progress * duration
+        let clamped = min(max(progress, 0), 1)
+        let seconds = clamped * duration
         let time = CMTime(seconds: seconds, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
         player.seek(to: time)
         currentTime = seconds
-        self.progress = progress
+        self.progress = clamped
     }
 
     private func resolvePreviewURL(for song: Song) async -> URL? {
@@ -1582,13 +1606,16 @@ final class PlaybackManager: ObservableObject {
     private func preparePlayer(with url: URL) {
         removeTimeObserver()
         removePlaybackEndObserver()
+        removeStatusObserver()
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
         try? AVAudioSession.sharedInstance().setActive(true)
         let item = AVPlayerItem(url: url)
         player = AVPlayer(playerItem: item)
-        duration = item.asset.duration.seconds.isFinite ? item.asset.duration.seconds : 0
+        duration = 0
         currentTime = 0
         progress = 0
+        observePlayerItem(item)
+        updateDurationIfNeeded(for: item)
         addTimeObserver()
         playbackEndObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
@@ -1610,9 +1637,12 @@ final class PlaybackManager: ObservableObject {
             let seconds = time.seconds
             self.currentTime = seconds
             if self.duration > 0 {
-                self.progress = seconds / self.duration
+                self.progress = min(max(seconds / self.duration, 0), 1)
             } else {
                 self.progress = 0
+                if let currentItem = player.currentItem {
+                    self.updateDurationIfNeeded(for: currentItem)
+                }
             }
         }
     }
@@ -1629,6 +1659,43 @@ final class PlaybackManager: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
             playbackEndObserver = nil
         }
+    }
+
+    private func observePlayerItem(_ item: AVPlayerItem) {
+        playerItemStatusObserver = item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
+            guard let self else { return }
+            Task { @MainActor in
+                switch observedItem.status {
+                case .readyToPlay:
+                    self.updateDurationIfNeeded(for: observedItem)
+                case .failed:
+                    self.handlePlaybackFailure(observedItem.error)
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    private func updateDurationIfNeeded(for item: AVPlayerItem) {
+        let durationCandidate = item.duration.seconds
+        let assetDuration = item.asset.duration.seconds
+        let resolved = durationCandidate.isFinite ? durationCandidate : assetDuration
+        guard resolved.isFinite, resolved > 0 else { return }
+        if abs(duration - resolved) > 0.01 {
+            duration = resolved
+        }
+    }
+
+    private func handlePlaybackFailure(_ error: Error?) {
+        let message = error?.localizedDescription ?? "unknown error"
+        debugLog("Preview playback failed: \(message)")
+        stop()
+    }
+
+    private func removeStatusObserver() {
+        playerItemStatusObserver?.invalidate()
+        playerItemStatusObserver = nil
     }
 }
 
@@ -2079,7 +2146,7 @@ struct Song: Identifiable, Hashable {
 }
 
 struct Playlist: Identifiable, Hashable {
-    let id = UUID()
+    let id: String
     let spotifyID: String?
     let title: String
     let subtitle: String
@@ -2089,6 +2156,7 @@ struct Playlist: Identifiable, Hashable {
     let isLikedSongs: Bool
 
     init(
+        id: String? = nil,
         spotifyID: String? = nil,
         title: String,
         subtitle: String,
@@ -2104,10 +2172,23 @@ struct Playlist: Identifiable, Hashable {
         self.colors = colors
         self.imageURL = imageURL
         self.isLikedSongs = isLikedSongs
+        self.id = id ?? spotifyID ?? Playlist.makeIdentifier(
+            title: title,
+            subtitle: subtitle,
+            descriptor: descriptor,
+            isLikedSongs: isLikedSongs
+        )
     }
 
     var gradient: LinearGradient {
         LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+
+    private static func makeIdentifier(title: String, subtitle: String, descriptor: String, isLikedSongs: Bool) -> String {
+        let normalized = [title, subtitle, descriptor]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .joined(separator: "|")
+        return isLikedSongs ? normalized + "|liked" : normalized
     }
 
     static func == (lhs: Playlist, rhs: Playlist) -> Bool {
@@ -2120,9 +2201,15 @@ struct Playlist: Identifiable, Hashable {
 }
 
 struct PlaylistDetail: Identifiable, Hashable {
-    let id = UUID()
+    let id: String
     let playlist: Playlist
     let songs: [Song]
+
+    init(playlist: Playlist, songs: [Song]) {
+        self.playlist = playlist
+        self.songs = songs
+        self.id = playlist.id
+    }
 
     static func == (lhs: PlaylistDetail, rhs: PlaylistDetail) -> Bool {
         lhs.id == rhs.id
@@ -2145,8 +2232,8 @@ struct SearchCategory: Identifiable {
     }
 }
 
-struct LibraryCollection: Identifiable {
-    let id = UUID()
+struct LibraryCollection: Identifiable, Hashable {
+    let id: String
     let title: String
     let subtitle: String
     let meta: String
@@ -2158,6 +2245,7 @@ struct LibraryCollection: Identifiable {
     let playlist: Playlist?
 
     init(
+        id: String? = nil,
         title: String,
         subtitle: String,
         meta: String,
@@ -2168,6 +2256,7 @@ struct LibraryCollection: Identifiable {
         imageURL: URL? = nil,
         playlist: Playlist? = nil
     ) {
+        self.id = id ?? playlist?.id ?? LibraryCollection.makeIdentifier(title: title, type: type)
         self.title = title
         self.subtitle = subtitle
         self.meta = meta
@@ -2181,6 +2270,19 @@ struct LibraryCollection: Identifiable {
 
     var gradient: LinearGradient {
         LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+
+    private static func makeIdentifier(title: String, type: LibraryFilter) -> String {
+        let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return "\(type.rawValue)|\(normalizedTitle)"
+    }
+
+    static func == (lhs: LibraryCollection, rhs: LibraryCollection) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
     }
 }
 

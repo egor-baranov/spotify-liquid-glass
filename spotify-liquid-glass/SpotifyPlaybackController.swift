@@ -23,6 +23,8 @@ final class SpotifyPlaybackController: NSObject, ObservableObject {
     private var isConnecting = false
     private var awaitingAuthorization = false
     private var currentTrackURI: String?
+    private var pendingActions: [PendingAction] = []
+    private var isSubscribedToPlayerState = false
 
     private override init() {
         let redirectURL = URL(string: SpotifyAuthConfiguration.redirectURI)!
@@ -56,12 +58,12 @@ final class SpotifyPlaybackController: NSObject, ObservableObject {
         trackDuration = 0
         currentArtwork = nil
         currentTrackURI = nil
-        lastAccessToken = token
-        appRemote.connectionParameters.accessToken = token
+        updateAccessToken(token)
 
         if appRemote.isConnected {
             debugLog("App Remote already connected, playing URI \(uri).")
             appRemote.playerAPI?.play(uri, callback: nil)
+            pendingURI = nil
         } else if awaitingAuthorization {
             debugLog("Awaiting Spotify authorization callback before connecting.")
         } else if isConnecting {
@@ -82,11 +84,16 @@ final class SpotifyPlaybackController: NSObject, ObservableObject {
 #if canImport(SpotifyiOS)
         if appRemote.isConnected {
             debugLog("Disconnecting App Remote session.")
+            if isSubscribedToPlayerState {
+                appRemote.playerAPI?.unsubscribe(toPlayerState: nil)
+                isSubscribedToPlayerState = false
+            }
             appRemote.disconnect()
         }
         isConnecting = false
         awaitingAuthorization = false
 #endif
+        pendingActions.removeAll()
         currentSong = nil
         pendingURI = nil
         isPlaying = false
@@ -98,54 +105,48 @@ final class SpotifyPlaybackController: NSObject, ObservableObject {
 
     func togglePlayPause() {
 #if canImport(SpotifyiOS)
-        guard appRemote.isConnected else { return }
-        if isPlaying {
-            debugLog("Sending pause to App Remote.")
-            appRemote.playerAPI?.pause(nil)
-        } else {
-            debugLog("Sending resume to App Remote.")
-            appRemote.playerAPI?.resume(nil)
+        let targetState = !isPlaying
+        guard appRemote.isConnected else {
+            enqueuePendingAction(.setPlaying(targetState))
+            return
         }
+        perform(action: .setPlaying(targetState))
 #endif
     }
 
     func skipToNext() {
 #if canImport(SpotifyiOS)
-        guard appRemote.isConnected else { return }
-        debugLog("Skipping to next track via App Remote.")
-        appRemote.playerAPI?.skip(toNext: nil)
+        guard appRemote.isConnected else {
+            enqueuePendingAction(.skipNext)
+            return
+        }
+        perform(action: .skipNext)
 #endif
     }
 
     func skipToPrevious() {
 #if canImport(SpotifyiOS)
-        guard appRemote.isConnected else { return }
-        debugLog("Skipping to previous track via App Remote.")
-        appRemote.playerAPI?.skip(toPrevious: nil)
+        guard appRemote.isConnected else {
+            enqueuePendingAction(.skipPrevious)
+            return
+        }
+        perform(action: .skipPrevious)
 #endif
     }
 
     func seek(toProgress progress: Double) {
 #if canImport(SpotifyiOS)
-        guard appRemote.isConnected,
-              trackDuration > 0 else { return }
-        let clamped = min(max(progress, 0), 1)
-        let targetSeconds = clamped * trackDuration
-        playbackPosition = targetSeconds
-        let milliseconds = Int(targetSeconds * 1000)
-        debugLog("Seeking App Remote playback to \(milliseconds)ms.")
-        appRemote.playerAPI?.seek(toPosition: milliseconds, callback: nil)
+        guard appRemote.isConnected else {
+            enqueuePendingAction(.seek(progress))
+            return
+        }
+        perform(action: .seek(progress))
 #endif
     }
 
     func reconnectIfNeeded() {
 #if canImport(SpotifyiOS)
-        guard currentSong != nil,
-              !appRemote.isConnected,
-              let token = lastAccessToken else { return }
-        debugLog("Attempting App Remote reconnect…")
-        appRemote.connectionParameters.accessToken = token
-        appRemote.connect()
+        synchronizeWithCurrentPlaybackIfAvailable()
 #endif
     }
 
@@ -161,18 +162,16 @@ final class SpotifyPlaybackController: NSObject, ObservableObject {
         }
         if appRemote.isConnected {
             debugLog("App entering background, disconnecting App Remote.")
+            if isSubscribedToPlayerState {
+                appRemote.playerAPI?.unsubscribe(toPlayerState: nil)
+                isSubscribedToPlayerState = false
+            }
             appRemote.disconnect()
         }
         awaitingAuthorization = false
         isConnecting = false
-#endif
         pendingURI = nil
-        currentSong = nil
-        isPlaying = false
-        playbackPosition = 0
-        trackDuration = 0
-        currentArtwork = nil
-        currentTrackURI = nil
+#endif
     }
 
     func handleIncomingURL(_ url: URL) -> Bool {
@@ -180,8 +179,7 @@ final class SpotifyPlaybackController: NSObject, ObservableObject {
         guard let parameters = appRemote.authorizationParameters(from: url) else { return false }
         if let token = parameters[SPTAppRemoteAccessTokenKey] {
             debugLog("Received App Remote token from Spotify callback.")
-            lastAccessToken = token
-            appRemote.connectionParameters.accessToken = token
+            updateAccessToken(token)
             awaitingAuthorization = false
             reconnectAfterAuthorization()
             return true
@@ -191,6 +189,33 @@ final class SpotifyPlaybackController: NSObject, ObservableObject {
         }
 #endif
         return false
+    }
+
+    func updateAccessToken(_ token: String?) {
+#if canImport(SpotifyiOS)
+        lastAccessToken = token
+        appRemote.connectionParameters.accessToken = token
+        if token == nil {
+            disconnect()
+        }
+#endif
+    }
+
+    func synchronizeWithCurrentPlaybackIfAvailable() {
+#if canImport(SpotifyiOS)
+        guard let token = lastAccessToken,
+              !token.isEmpty,
+              UIApplication.shared.canOpenURL(URL(string: "spotify://")!)
+        else { return }
+        if appRemote.isConnected {
+            requestCurrentPlayerState()
+            return
+        }
+        guard !isConnecting, !awaitingAuthorization else { return }
+        debugLog("Connecting to Spotify App Remote to sync existing playback.")
+        isConnecting = true
+        appRemote.connect()
+#endif
     }
 
     private func reconnectAfterAuthorization() {
@@ -243,22 +268,15 @@ extension SpotifyPlaybackController: SPTAppRemoteDelegate, SPTAppRemotePlayerSta
         isConnecting = false
         awaitingAuthorization = false
         appRemote.playerAPI?.delegate = self
+        subscribeToPlayerStateIfNeeded()
         if let uri = pendingURI {
             debugLog("App Remote connected, playing pending URI \(uri).")
             appRemote.playerAPI?.play(uri, callback: nil)
+            pendingURI = nil
         } else {
-            appRemote.playerAPI?.getPlayerState { [weak self] _, state in
-                guard
-                    let state = state as? SPTAppRemotePlayerState,
-                    let self = self
-                else { return }
-                debugLog("App Remote connected, pulled current player state.")
-                let positionSeconds = Double(state.playbackPosition) / 1000
-                self.playbackPosition = positionSeconds
-                self.trackDuration = Double(state.track.duration) / 1000
-                self.updateSong(from: state.track, isPaused: state.isPaused, position: positionSeconds)
-            }
+            requestCurrentPlayerState()
         }
+        flushPendingActions()
     }
 
     func appRemote(_ appRemote: SPTAppRemote, didDisconnectWithError error: Error?) {
@@ -266,6 +284,10 @@ extension SpotifyPlaybackController: SPTAppRemoteDelegate, SPTAppRemotePlayerSta
         isConnecting = false
         awaitingAuthorization = false
         isPlaying = false
+        if isSubscribedToPlayerState {
+            appRemote.playerAPI?.unsubscribe(toPlayerState: nil)
+            isSubscribedToPlayerState = false
+        }
         pendingURI = nil
         currentSong = nil
         playbackPosition = 0
@@ -322,6 +344,80 @@ extension SpotifyPlaybackController: SPTAppRemoteDelegate, SPTAppRemotePlayerSta
             playbackPosition = position
         }
         fetchArtworkIfNeeded(for: track)
+    }
+
+    private func requestCurrentPlayerState() {
+        appRemote.playerAPI?.getPlayerState { [weak self] _, state in
+            guard
+                let self,
+                let playerState = state as? SPTAppRemotePlayerState
+            else { return }
+            let positionSeconds = Double(playerState.playbackPosition) / 1000
+            self.playbackPosition = positionSeconds
+            self.trackDuration = Double(playerState.track.duration) / 1000
+            self.updateSong(from: playerState.track, isPaused: playerState.isPaused, position: positionSeconds)
+        }
+    }
+
+    private func subscribeToPlayerStateIfNeeded() {
+        guard !isSubscribedToPlayerState else { return }
+        appRemote.playerAPI?.subscribe(toPlayerState: { [weak self] _, error in
+            if let error {
+                debugLog("Failed to subscribe to player state: \(error.localizedDescription)")
+                return
+            }
+            self?.isSubscribedToPlayerState = true
+            debugLog("Subscribed to Spotify player state updates.")
+        })
+    }
+    private enum PendingAction {
+        case setPlaying(Bool)
+        case skipNext
+        case skipPrevious
+        case seek(Double)
+    }
+
+    private func enqueuePendingAction(_ action: PendingAction) {
+        pendingActions.append(action)
+        synchronizeWithCurrentPlaybackIfAvailable()
+    }
+
+    private func flushPendingActions() {
+        guard appRemote.isConnected else { return }
+        let actions = pendingActions
+        pendingActions.removeAll()
+        actions.forEach { perform(action: $0) }
+    }
+
+    private func perform(action: PendingAction) {
+        guard appRemote.isConnected else {
+            enqueuePendingAction(action)
+            return
+        }
+        switch action {
+        case .setPlaying(let shouldPlay):
+            debugLog("Setting remote playback state to \(shouldPlay ? "play" : "pause").")
+            isPlaying = shouldPlay
+            if shouldPlay {
+                appRemote.playerAPI?.resume(nil)
+            } else {
+                appRemote.playerAPI?.pause(nil)
+            }
+        case .skipNext:
+            debugLog("Executing pending skip next.")
+            appRemote.playerAPI?.skip(toNext: nil)
+        case .skipPrevious:
+            debugLog("Executing pending skip previous.")
+            appRemote.playerAPI?.skip(toPrevious: nil)
+        case .seek(let progress):
+            guard trackDuration > 0 else { return }
+            let clamped = min(max(progress, 0), 1)
+            let targetSeconds = clamped * trackDuration
+            playbackPosition = targetSeconds
+            let milliseconds = Int(targetSeconds * 1000)
+            debugLog("Executing pending seek to \(milliseconds)ms.")
+            appRemote.playerAPI?.seek(toPosition: milliseconds, callback: nil)
+        }
     }
 }
 #endif
