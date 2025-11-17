@@ -1283,6 +1283,8 @@ struct RemoteMiniPlayerView: View {
 struct PlayerFullScreenView: View {
     @ObservedObject var playback: PlaybackManager
     let onClose: () -> Void
+    @State private var isScrubbing = false
+    @State private var scrubbingProgress: Double = 0
 
     var body: some View {
         ZStack {
@@ -1338,10 +1340,26 @@ struct PlayerFullScreenView: View {
                 VStack(spacing: 18) {
                     Slider(
                         value: Binding(
-                            get: { playback.progress },
-                            set: { playback.seek(to: $0) }
+                            get: { isScrubbing ? scrubbingProgress : playback.progress },
+                            set: { newValue in
+                                if isScrubbing {
+                                    scrubbingProgress = newValue
+                                } else {
+                                    playback.seek(to: newValue)
+                                }
+                            }
                         ),
-                        in: 0...1
+                        in: 0...1,
+                        onEditingChanged: { editing in
+                            guard playback.duration > 0 else { return }
+                            if editing {
+                                isScrubbing = true
+                                scrubbingProgress = playback.progress
+                            } else {
+                                isScrubbing = false
+                                playback.seek(to: scrubbingProgress)
+                            }
+                        }
                     )
                     .accentColor(.white)
                     .padding(.horizontal, 16)
@@ -1349,7 +1367,7 @@ struct PlayerFullScreenView: View {
                     .opacity(playback.duration == 0 ? 0.5 : 1)
 
                     HStack {
-                        Text(playback.elapsedText)
+                        Text(displayedElapsedText)
                         Spacer()
                         Text(playback.durationText)
                     }
@@ -1380,11 +1398,22 @@ struct PlayerFullScreenView: View {
             .padding(.bottom, 52)
         }
     }
+
+    private var displayedElapsedText: String {
+        guard playback.duration > 0 else { return playback.elapsedText }
+        if isScrubbing {
+            let seconds = scrubbingProgress * playback.duration
+            return seconds.asTimeString()
+        }
+        return playback.elapsedText
+    }
 }
 
 struct RemotePlayerFullScreenView: View {
     @ObservedObject var remote: SpotifyPlaybackController
     let onClose: () -> Void
+    @State private var isScrubbing = false
+    @State private var scrubbingProgress: Double = 0
 
     var body: some View {
         ZStack {
@@ -1441,11 +1470,32 @@ struct RemotePlayerFullScreenView: View {
                         value: Binding(
                             get: {
                                 guard remote.trackDuration > 0 else { return 0 }
-                                return remote.playbackPosition / max(remote.trackDuration, 0.001)
+                                if isScrubbing {
+                                    return scrubbingProgress
+                                }
+                                let progress = remote.playbackPosition / max(remote.trackDuration, 0.001)
+                                return min(max(progress, 0), 1)
                             },
-                            set: { remote.seek(toProgress: $0) }
+                            set: { newValue in
+                                if isScrubbing {
+                                    scrubbingProgress = newValue
+                                } else {
+                                    remote.seek(toProgress: newValue)
+                                }
+                            }
                         ),
-                        in: 0...1
+                        in: 0...1,
+                        onEditingChanged: { editing in
+                            guard remote.trackDuration > 0 else { return }
+                            if editing {
+                                isScrubbing = true
+                                let progress = remote.playbackPosition / max(remote.trackDuration, 0.001)
+                                scrubbingProgress = min(max(progress, 0), 1)
+                            } else {
+                                isScrubbing = false
+                                remote.seek(toProgress: scrubbingProgress)
+                            }
+                        }
                     )
                     .accentColor(.white)
                     .padding(.horizontal, 16)
@@ -1453,7 +1503,7 @@ struct RemotePlayerFullScreenView: View {
                     .opacity(remote.trackDuration == 0 ? 0.5 : 1)
 
                     HStack {
-                        Text(remote.playbackPosition.asTimeString())
+                        Text(remoteElapsedText)
                         Spacer()
                         Text(remote.trackDuration.asTimeString())
                     }
@@ -1480,6 +1530,15 @@ struct RemotePlayerFullScreenView: View {
             .padding(.horizontal, 28)
             .padding(.bottom, 52)
         }
+    }
+
+    private var remoteElapsedText: String {
+        guard remote.trackDuration > 0 else { return remote.playbackPosition.asTimeString() }
+        if isScrubbing {
+            let seconds = scrubbingProgress * remote.trackDuration
+            return seconds.asTimeString()
+        }
+        return remote.playbackPosition.asTimeString()
     }
 }
 
